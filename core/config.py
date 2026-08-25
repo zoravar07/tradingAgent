@@ -41,14 +41,47 @@ class ScreenerConfig(BaseModel):
     stage2: Stage2Config = Stage2Config()
 
 
+class LerpRange(BaseModel):
+    """A value that scales linearly with conviction score, 0-100 -> at_0..at_100."""
+
+    at_0: float
+    at_100: float
+
+
+class ConvictionScalingConfig(BaseModel):
+    activation_threshold_pct: LerpRange = LerpRange(at_0=8, at_100=35)
+    trailing_stop_atr_multiple: LerpRange = LerpRange(at_0=1.5, at_100=4.5)
+    profit_taking_start_pct: LerpRange = LerpRange(at_0=15, at_100=60)
+
+
+class RiskConfig(BaseModel):
+    max_position_pct: float = 12
+    max_sector_pct: float = 40
+    max_correlated_cluster_pct: float = 50
+    max_daily_proposals: int = 5
+    max_daily_loss_pct: float = 3
+    max_drawdown_pct: float = 12
+    min_order_value_usd: float = 150
+    # Below: §5.3 names these mechanisms ("position sizing from conviction
+    # and volatility", "thesis decay since entry") but doesn't give exact
+    # formulas/thresholds. Defaults chosen here, not spec'd — see
+    # risk_rules.py docstring for the reasoning.
+    reference_atr_pct_of_price: float = 3.0
+    min_volatility_size_multiplier: float = 0.25
+    thesis_decay_trigger_pts: float = 15.0
+
+
 class Config(BaseModel):
-    # extra="allow" so unmodeled sections (risk, sources, ...) round-trip
+    # extra="allow" so unmodeled sections (sources, sleeves, ...) round-trip
     # instead of being rejected — they just aren't validated or typed yet.
     model_config = ConfigDict(extra="allow")
 
     version: int = 1
     portfolio: PortfolioConfig = PortfolioConfig()
     screener: ScreenerConfig = ScreenerConfig()
+    risk: RiskConfig = RiskConfig()
+    conviction_scaling: ConvictionScalingConfig = ConvictionScalingConfig()
+    conviction_weights: dict[str, float] = {}
 
 
 def load_config(path: str | Path) -> Config:

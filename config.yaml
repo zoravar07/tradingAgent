@@ -48,6 +48,12 @@ risk:
   max_daily_loss_pct: 3
   max_drawdown_pct: 12
   min_order_value_usd: 150          # avoid orders where costs dominate
+  # Below: §5.3 names "position sizing from conviction and volatility" and
+  # "thesis decay since entry" as mechanisms but doesn't give formulas or
+  # thresholds. Defaults chosen here, not spec'd — see risk_rules.py.
+  reference_atr_pct_of_price: 3.0   # ATR as % of price treated as "normal" volatility
+  min_volatility_size_multiplier: 0.25  # a highly volatile name still gets >= 25% of its conviction-implied size
+  thesis_decay_trigger_pts: 15.0    # conviction-point drop since entry that flags decay
 
 conviction_weights:                 # auto-normalised; add or remove freely
   business_quality: 0.15

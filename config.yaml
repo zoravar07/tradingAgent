@@ -17,6 +17,14 @@ screener:
     min_avg_daily_volume_usd: 20000000
     min_market_cap_usd: 2000000000
     max_survivors: 40
+    # Below: §5.1 names these gates ("fundamental floor", "valuation bands",
+    # "earnings proximity flag") but the spec text doesn't give numbers.
+    # Defaults chosen here, not spec'd — revisit once step 4's output has
+    # been eyeballed against real names (per §10 step 4).
+    min_revenue_growth_pct: 5.0      # fundamental floor: positive FCF OR growth >= this
+    valuation_pe_cheap_max: 15.0     # trailing P/E at or below this -> "cheap" (flag only)
+    valuation_pe_expensive_min: 30.0 # trailing P/E at or above this -> "expensive" (flag only)
+    earnings_proximity_days: 5       # flag if earnings are within this many days
   stage2:
     model: claude-haiku-4-5
     lookback_days: 7

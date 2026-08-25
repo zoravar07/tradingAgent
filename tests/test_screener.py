@@ -1,8 +1,20 @@
 import pytest
 
-from agents.screener import ScreenerInput, evaluate_stage1, run_stage1, select_survivors
-from core.config import Stage1Config
+from agents.screener import (
+    ScreenerInput,
+    Stage2Result,
+    Stage2Verdict,
+    evaluate_stage1,
+    run_stage1,
+    run_stage2_batch,
+    run_stage2_triage,
+    select_stage2_survivors,
+    select_survivors,
+)
+from core.config import Stage1Config, Stage2Config
+from core.llm import LLMClient, MonthlySpendTracker
 from sources.prices import TechnicalSnapshot
+from tests.test_llm import FakeClient, FakeResponse
 
 
 def snapshot(**overrides) -> TechnicalSnapshot:
@@ -190,4 +202,94 @@ class TestSelectSurvivors:
         config = Stage1Config(max_survivors=10)
         items = [candidate("BAD", market_cap_usd=100)]
         survivors = select_survivors(run_stage1(items, config), config)
+        assert survivors == []
+
+
+# -------------------------------------------------------------------- Stage 2
+
+STAGE2_CONFIG = Stage2Config()
+
+
+def make_llm(tmp_path, script):
+    return LLMClient(FakeClient(script), MonthlySpendTracker(tmp_path / "spend.json", 40.0, month_fn=lambda: "2026-08"))
+
+
+def stage1_result_for(ticker, is_held=False, rank_score=5.0):
+    items = [candidate(ticker, is_held=is_held, technical=snapshot(relative_strength_vs_spy_pct=rank_score))]
+    return run_stage1(items, DEFAULT_CONFIG)[0]
+
+
+class TestRunStage2Triage:
+    def test_material_verdict_passes_non_held(self, tmp_path):
+        llm = make_llm(tmp_path, [FakeResponse(parsed_output=Stage2Verdict(verdict="new contract win", material=True))])
+        result = run_stage2_triage(llm, stage1_result_for("AMD"), STAGE2_CONFIG)
+        assert result.passed is True
+        assert result.material is True
+        assert result.ok is True
+
+    def test_non_material_verdict_fails_non_held(self, tmp_path):
+        llm = make_llm(tmp_path, [FakeResponse(parsed_output=Stage2Verdict(verdict="nothing new", material=False))])
+        result = run_stage2_triage(llm, stage1_result_for("AMD"), STAGE2_CONFIG)
+        assert result.passed is False
+
+    def test_held_position_passes_regardless_of_verdict(self, tmp_path):
+        llm = make_llm(tmp_path, [FakeResponse(parsed_output=Stage2Verdict(verdict="nothing new", material=False))])
+        result = run_stage2_triage(llm, stage1_result_for("AMD", is_held=True), STAGE2_CONFIG)
+        assert result.passed is True
+
+    def test_llm_failure_does_not_raise(self, tmp_path):
+        llm = make_llm(tmp_path, [RuntimeError("api down"), RuntimeError("still down"), RuntimeError("still down")])
+        result = run_stage2_triage(llm, stage1_result_for("AMD"), STAGE2_CONFIG)
+        assert result.ok is False
+        assert "api down" in result.error or "still down" in result.error
+        assert result.passed is False  # non-held, failed triage -> dropped
+
+    def test_llm_failure_on_held_position_still_passes(self, tmp_path):
+        llm = make_llm(tmp_path, [RuntimeError("api down"), RuntimeError("x"), RuntimeError("x")])
+        result = run_stage2_triage(llm, stage1_result_for("AMD", is_held=True), STAGE2_CONFIG)
+        assert result.ok is False
+        assert result.passed is True  # held positions always enter the pipeline (§5)
+
+
+class TestRunStage2Batch:
+    def test_one_call_per_candidate(self, tmp_path):
+        results = [
+            stage1_result_for("AMD"),
+            stage1_result_for("NVDA"),
+        ]
+        llm = make_llm(
+            tmp_path,
+            [
+                FakeResponse(parsed_output=Stage2Verdict(verdict="a", material=True)),
+                FakeResponse(parsed_output=Stage2Verdict(verdict="b", material=False)),
+            ],
+        )
+        batch = run_stage2_batch(llm, results, STAGE2_CONFIG)
+        assert [r.ticker for r in batch] == ["AMD", "NVDA"]
+
+
+class TestSelectStage2Survivors:
+    def test_held_always_included(self, tmp_path):
+        config = Stage2Config(max_survivors=0)
+        s1_held = stage1_result_for("HELD", is_held=True)
+        results = [Stage2Result(ticker="HELD", verdict="", material=False, passed=True, is_held=True)]
+        survivors = select_stage2_survivors(results, {"HELD": s1_held}, config)
+        assert [r.ticker for r in survivors] == ["HELD"]
+
+    def test_trims_material_candidates_by_stage1_rank(self, tmp_path):
+        config = Stage2Config(max_survivors=1)
+        s1_low = stage1_result_for("LOW", rank_score=1.0)
+        s1_high = stage1_result_for("HIGH", rank_score=9.0)
+        results = [
+            Stage2Result(ticker="LOW", verdict="", material=True, passed=True, is_held=False),
+            Stage2Result(ticker="HIGH", verdict="", material=True, passed=True, is_held=False),
+        ]
+        survivors = select_stage2_survivors(results, {"LOW": s1_low, "HIGH": s1_high}, config)
+        assert [r.ticker for r in survivors] == ["HIGH"]
+
+    def test_non_material_excluded_even_within_cap(self, tmp_path):
+        config = Stage2Config(max_survivors=10)
+        s1 = stage1_result_for("AMD")
+        results = [Stage2Result(ticker="AMD", verdict="", material=False, passed=False, is_held=False)]
+        survivors = select_stage2_survivors(results, {"AMD": s1}, config)
         assert survivors == []

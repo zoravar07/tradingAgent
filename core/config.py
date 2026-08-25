@@ -71,6 +71,10 @@ class RiskConfig(BaseModel):
     thesis_decay_trigger_pts: float = 15.0
 
 
+class BudgetConfig(BaseModel):
+    monthly_api_cap_usd: float = 40
+
+
 class Config(BaseModel):
     # extra="allow" so unmodeled sections (sources, sleeves, ...) round-trip
     # instead of being rejected — they just aren't validated or typed yet.
@@ -82,6 +86,7 @@ class Config(BaseModel):
     risk: RiskConfig = RiskConfig()
     conviction_scaling: ConvictionScalingConfig = ConvictionScalingConfig()
     conviction_weights: dict[str, float] = {}
+    budget: BudgetConfig = BudgetConfig()
 
 
 def load_config(path: str | Path) -> Config:

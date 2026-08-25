@@ -1,6 +1,5 @@
-"""Screener — §10 step 4: Stage 1 only (pure quant, no LLM, no cost). Stage 2
-(Haiku triage, §5.1) is build-order step 6 — the first LLM integration — and
-deliberately isn't started here.
+"""Screener — Stage 1 (§10 step 4: pure quant, no LLM, no cost) and Stage 2
+(§10 step 6: Haiku triage — the first LLM integration).
 
 §5.1's Stage 1 gates:
   liquidity (min ADV, min market cap) · price vs 50/200 DMA · relative
@@ -26,7 +25,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from core.config import Stage1Config
+from pydantic import BaseModel
+
+from core.config import Stage1Config, Stage2Config
+from core.llm import LLMClient, UsageRecord
 from sources.prices import TechnicalSnapshot
 
 ValuationBand = Literal["cheap", "fair", "expensive", "unknown"]
@@ -148,6 +150,102 @@ def select_survivors(results: list[Stage1Result], config: Stage1Config) -> list[
     ranked = sorted(
         non_held_passed,
         key=lambda r: (r.rank_score is not None, r.rank_score if r.rank_score is not None else float("-inf")),
+        reverse=True,
+    )
+    return held + ranked[: config.max_survivors]
+
+
+# ---------------------------------------------------------------- Stage 2
+
+STAGE2_SYSTEM_PROMPT = (
+    "You are a fast pre-screen triage analyst. Given a ticker and a lookback "
+    "window, state in one line whether there has been any material development "
+    "recently — new contracts, guidance changes, regulatory news, a management "
+    "change, or a sector shock affecting this name. Set material=true only for "
+    "something that could meaningfully change the investment case, not routine "
+    "news or ordinary price movement. Be concise and specific in the verdict."
+)
+
+
+class Stage2Verdict(BaseModel):
+    verdict: str
+    material: bool
+
+
+@dataclass
+class Stage2Result:
+    ticker: str
+    verdict: str
+    material: bool
+    passed: bool
+    is_held: bool
+    usage: UsageRecord | None = None
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
+
+
+def run_stage2_triage(llm: LLMClient, stage1_result: Stage1Result, config: Stage2Config) -> Stage2Result:
+    """One Haiku call per Stage 1 survivor (§5.1). A failed call (budget
+    exhausted, malformed output after retries, API error) doesn't crash the
+    run — it surfaces as `error` and, for a held position, still `passed`
+    (§5's held-always-enters-pipeline rule doesn't get weaker just because
+    triage failed); a non-held name with a failed triage is dropped, same as
+    one triage correctly found not material."""
+    user_message = (
+        f"Ticker: {stage1_result.ticker}\nLookback: last {config.lookback_days} days\n"
+        "Has anything material happened to this name recently?"
+    )
+    try:
+        result = llm.call_structured(
+            model=config.model,
+            system=STAGE2_SYSTEM_PROMPT,
+            user_message=user_message,
+            output_model=Stage2Verdict,
+            max_tokens=256,
+        )
+    except Exception as exc:  # noqa: BLE001 — one bad triage must not kill the run
+        return Stage2Result(
+            ticker=stage1_result.ticker,
+            verdict="",
+            material=False,
+            passed=stage1_result.is_held,
+            is_held=stage1_result.is_held,
+            error=str(exc),
+        )
+
+    verdict = result.parsed
+    return Stage2Result(
+        ticker=stage1_result.ticker,
+        verdict=verdict.verdict,
+        material=verdict.material,
+        passed=stage1_result.is_held or verdict.material,
+        is_held=stage1_result.is_held,
+        usage=result.usage,
+    )
+
+
+def run_stage2_batch(llm: LLMClient, stage1_results: list[Stage1Result], config: Stage2Config) -> list[Stage2Result]:
+    return [run_stage2_triage(llm, r, config) for r in stage1_results]
+
+
+def select_stage2_survivors(
+    results: list[Stage2Result], stage1_by_ticker: dict[str, Stage1Result], config: Stage2Config
+) -> list[Stage2Result]:
+    """§5's pipeline diagram shows Stage 2 trimming ~40 -> ~15
+    (`config.max_survivors`); the spec doesn't state the trim rule beyond
+    the material/not-material flag itself, so: held positions always pass
+    through (as in Stage 1); among the rest, only names flagged `material`
+    are candidates for a full research memo (a Haiku call finding nothing
+    material is itself a reason to not spend a Sonnet call); if more than
+    `max_survivors` are material, keep the ones Stage 1 ranked highest."""
+    held = [r for r in results if r.is_held]
+    non_held_passed = [r for r in results if not r.is_held and r.passed]
+    ranked = sorted(
+        non_held_passed,
+        key=lambda r: stage1_by_ticker[r.ticker].rank_score or float("-inf"),
         reverse=True,
     )
     return held + ranked[: config.max_survivors]

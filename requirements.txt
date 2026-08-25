@@ -1,5 +1,6 @@
-# Step 1 (skeleton) + step 2 (portfolio) + step 3 (FMP source) dependencies.
-# FastAPI/React/Alembic/Anthropic SDK etc. get added as later build-order steps land.
+# Step 1 (skeleton) + step 2 (portfolio) + step 3 (FMP source) +
+# step 5/6 (scoring/risk/LLM) dependencies. FastAPI/React/Alembic get added
+# as later build-order steps land.
 pandas>=2.2
 SQLAlchemy>=2.0
 pydantic>=2.7
@@ -7,3 +8,4 @@ PyYAML>=6.0
 pytest>=8.0
 requests>=2.31
 python-dotenv>=1.0
+anthropic>=0.69  # core/llm.py's AnthropicClient protocol matches this SDK's messages.parse()

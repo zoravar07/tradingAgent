@@ -58,7 +58,8 @@ from core.briefing import (
 )
 from core.config import Config, UniverseConfig
 from core.llm import LLMClient
-from core.models import Candidate, Conviction as ConvictionRow, Proposal, ResearchOutput, RiskEvent, Run
+from core.briefing_persistence import serialize_briefing
+from core.models import BriefingRecord, Candidate, Conviction as ConvictionRow, Proposal, ResearchOutput, RiskEvent, Run
 from core.models import WatchlistItem as WatchlistItemRow
 from core.money import Money, usd
 from core.nav import compute_nav, record_nav
@@ -175,6 +176,13 @@ def run_nightly(
         briefing = _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row)
         run_row.status = "blocked" if briefing.blocked is not None else "succeeded"
         run_row.finished_at = _utcnow()
+        # §10 step 10 gap: persist the assembled Briefing itself, not just
+        # the rows it was built from — the UI reads this back exactly as
+        # produced, rather than trying to reconstruct it (unreliably; the
+        # live price used that night isn't stored anywhere else).
+        session.add(
+            BriefingRecord(run_id=run_row.id, briefing_json=serialize_briefing(briefing), created_at=_utcnow())
+        )
         session.flush()
         logger.info("run %s run_id=%s", run_row.status, run_row.id)
         return briefing

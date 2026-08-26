@@ -284,6 +284,16 @@ class TestFullNightlyRun:
         assert nav_row.drawdown_pct == 0.0  # first-ever snapshot
         assert briefing.portfolio_health.cash_pct == pytest.approx(98.224, abs=0.01)
 
+        # --- the assembled briefing itself was persisted (§10 step 10 gap)
+        from core.briefing_persistence import deserialize_briefing
+        from core.models import BriefingRecord
+
+        run_row = session.execute(select(Run)).scalar_one()
+        record = session.execute(select(BriefingRecord).where(BriefingRecord.run_id == run_row.id)).scalar_one()
+        stored = deserialize_briefing(record.briefing_json)
+        assert stored["book"][0]["ticker"] == "NBIS"
+        assert stored["actions_today"][0]["order"]["ticker"] == "AMD"
+
     def test_kill_switch_blocks_new_buys_but_not_exits(self, session, portfolio, tmp_path):
         portfolio.add_manual_position("NBIS", qty=8, avg_cost=218.0, opened_at=dt.datetime(2026, 7, 1), conviction_at_entry=68.0)
 

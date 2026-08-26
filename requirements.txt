@@ -10,4 +10,7 @@ requests>=2.31
 python-dotenv>=1.0
 anthropic>=0.69  # core/llm.py's AnthropicClient protocol matches this SDK's messages.parse()
 yfinance>=0.2  # sources/yfinance_source.py — prices/historicals, no plan-tier gating unlike FMP quote
+fastapi>=0.115
+uvicorn>=0.30
+httpx>=0.27  # not called directly — fastapi.testclient.TestClient needs it installed
 croniter>=2.0  # core/schedule.py — reads config.yaml's schedule.nightly_run cron string

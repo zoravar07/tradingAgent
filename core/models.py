@@ -182,3 +182,22 @@ class NavSnapshot(Base):
     drawdown_pct: Mapped[float] = mapped_column(Float, nullable=False)
     daily_loss_pct: Mapped[float] = mapped_column(Float, nullable=False)
     recorded_at: Mapped[dt.datetime] = mapped_column(DateTime, nullable=False)
+
+
+class BriefingRecord(Base):
+    """Not in §6's original schema — a gap step 9 left for step 10 (§10 UI
+    design, 2026-08-26): `run_nightly` builds a `Briefing` object in memory
+    and returns it, but nothing persisted the *assembled* result — only the
+    underlying facts (Proposal/Candidate/Conviction/NavSnapshot rows).
+    Reconstructing an accurate BookEntry (weight %, P&L) from those alone
+    isn't reliable — the live price used that night isn't stored anywhere
+    else. One row per run, storing core.briefing.Briefing serialized as JSON
+    (core/briefing_persistence.py) — the exact record of what the briefing
+    said, not a re-derivation of it later."""
+
+    __tablename__ = "briefings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("runs.id"), nullable=False, unique=True)
+    briefing_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, nullable=False)

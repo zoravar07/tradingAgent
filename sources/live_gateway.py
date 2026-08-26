@@ -9,10 +9,17 @@ small set of large-cap tickers — every ETF and several smaller holdings
 402'd, which silently understated NAV (positions with no price contribute
 nothing to it). Current price and historical bars now come from
 sources/yfinance_source.py (free, no key, confirmed to cover every ticker
-FMP's quote endpoint rejected). Fundamentals, earnings, analyst estimates,
-and 13F/insider data stay on FMPClient — that part of the integration
-worked fine and there's no reason to replace it. `get_sector` also stays on
-FMP's profile endpoint, which was never gated (only `quote` was).
+FMP's quote endpoint rejected). A second live run then found the SAME plan
+also gates `income-statement`/`cash-flow-statement` for the same tickers —
+so fundamentals now try FMP first (it has a richer field set, and worked
+fine for names it wasn't gated on) and fall back to yfinance's mapped
+fundamentals (sources/yfinance_source.py's INCOME_STATEMENT_FIELD_MAP /
+CASH_FLOW_FIELD_MAP — a verified subset, not the full FMP schema) via
+`_income_statement`/`_cash_flow_statement` below. Earnings surprises,
+analyst estimates, price targets, and 13F/insider data stay FMP-only — no
+gating observed there yet, and yfinance has no equivalent to fall back to.
+`get_sector` also stays on FMP's profile endpoint, which was never gated
+(only `quote` and the fundamentals endpoints were).
 
 Known gaps, flagged rather than silently guessed at:
 
@@ -81,6 +88,34 @@ class LiveMarketDataGateway:
                 return [*default, {"error": str(exc)}]
             return default
 
+    def _income_statement(self, ticker: str, limit: int) -> tuple[list[dict], str]:
+        """FMP first; yfinance fallback (a verified field subset, see
+        sources/yfinance_source.py) when FMP fails. Returns (rows, source)
+        so callers can note in the research context which one actually
+        served the data — worth knowing when reading raw output."""
+        try:
+            return self.fmp.get_income_statement(ticker, limit=limit), "fmp"
+        except Exception as fmp_exc:  # noqa: BLE001
+            try:
+                return self.yf.get_income_statement(ticker, limit=limit), "yfinance_fallback"
+            except Exception as yf_exc:  # noqa: BLE001
+                raise RuntimeError(
+                    f"income statement unavailable for {ticker}: FMP failed ({fmp_exc}), "
+                    f"yfinance fallback also failed ({yf_exc})"
+                ) from yf_exc
+
+    def _cash_flow_statement(self, ticker: str, limit: int) -> tuple[list[dict], str]:
+        try:
+            return self.fmp.get_cash_flow_statement(ticker, limit=limit), "fmp"
+        except Exception as fmp_exc:  # noqa: BLE001
+            try:
+                return self.yf.get_cash_flow_statement(ticker, limit=limit), "yfinance_fallback"
+            except Exception as yf_exc:  # noqa: BLE001
+                raise RuntimeError(
+                    f"cash flow statement unavailable for {ticker}: FMP failed ({fmp_exc}), "
+                    f"yfinance fallback also failed ({yf_exc})"
+                ) from yf_exc
+
     # ------------------------------------------------------------ screener
 
     def get_screener_input(self, ticker: str, is_held: bool) -> ScreenerInput:
@@ -90,8 +125,8 @@ class LiveMarketDataGateway:
         # (P/E, avg volume fallback); price itself comes from yfinance below,
         # so a quote failure degrades this ticker's data, doesn't drop it.
         quote = self._safe(lambda: self.fmp.get_quote(ticker), {})
-        income = self.fmp.get_income_statement(ticker, limit=2)
-        cash_flow = self.fmp.get_cash_flow_statement(ticker, limit=1)
+        income, _ = self._income_statement(ticker, limit=2)
+        cash_flow, _ = self._cash_flow_statement(ticker, limit=1)
         bars = self.yf.get_historical_bars(ticker)
 
         technical = compute_technical_snapshot(bars, spy_bars=self._spy_bars(), sector_bars=None)
@@ -126,8 +161,8 @@ class LiveMarketDataGateway:
         # without its own try/except around every field.
         profile = self._safe(lambda: self.fmp.get_profile(ticker), {})
         quote = self._safe(lambda: self.fmp.get_quote(ticker), {})
-        income = self._safe(lambda: self.fmp.get_income_statement(ticker, limit=3), [])
-        cash_flow = self._safe(lambda: self.fmp.get_cash_flow_statement(ticker, limit=3), [])
+        income, income_source = self._safe(lambda: self._income_statement(ticker, limit=3), ([], "unavailable"))
+        cash_flow, cash_flow_source = self._safe(lambda: self._cash_flow_statement(ticker, limit=3), ([], "unavailable"))
         earnings = self._safe(lambda: self.fmp.get_earnings_surprises(ticker, limit=4), [])
         estimates = self._safe(lambda: self.fmp.get_analyst_estimates(ticker, limit=2), [])
         price_target = self._safe(lambda: self.fmp.get_price_target_summary(ticker), {})
@@ -145,8 +180,8 @@ class LiveMarketDataGateway:
             f"Price: {current_price}  P/E: {profile.get('pe')}",  # current_price from yfinance, not FMP quote
             f"Description: {profile.get('description', '')[:1000]}",
             "",
-            f"Income statements (most recent first): {income}",
-            f"Cash flow statements (most recent first): {cash_flow}",
+            f"Income statements (most recent first, source={income_source}): {income}",
+            f"Cash flow statements (most recent first, source={cash_flow_source}): {cash_flow}",
             f"Earnings surprises (most recent first): {earnings}",
             f"Analyst estimates: {estimates}",
             f"Price target summary: {price_target}",

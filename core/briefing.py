@@ -64,6 +64,20 @@ class BookEntry:
     distance_to_trailing_stop_pct: float | None = None  # <= 0 means the stop is currently breached
     next_profit_band_pct: float | None = None
     has_exit_trigger: bool = False
+    # Not in §3 — added per the user's explicit request. A held position
+    # with no conviction score has no thesis-decay trigger and no
+    # conviction-scaled stop/profit thresholds this run: it is effectively
+    # unmonitored. "conviction n/a" in a table read too easily as routine
+    # missing data rather than a real coverage gap — this flag exists so
+    # the table itself says so, on top of the top-of-briefing banner
+    # (see UnresearchedHolding / Briefing.unresearched_holdings below).
+    no_research_coverage: bool = False
+
+
+@dataclass
+class UnresearchedHolding:
+    ticker: str
+    reason: str
 
 
 @dataclass
@@ -105,6 +119,7 @@ class Briefing:
     portfolio_health: PortfolioHealth
     drift_warning: DriftStatus | None = None
     blocked: BlockedStatus | None = None
+    unresearched_holdings: list[UnresearchedHolding] = field(default_factory=list)
 
 
 def sort_actions_by_conviction(items: list[ActionItem]) -> list[ActionItem]:
@@ -132,6 +147,7 @@ def assemble_briefing(
     book: list[BookEntry],
     portfolio_health: PortfolioHealth,
     drift: DriftStatus | None,
+    unresearched_holdings: list[UnresearchedHolding] | None = None,
 ) -> Briefing:
     return Briefing(
         generated_at=generated_at,
@@ -140,6 +156,7 @@ def assemble_briefing(
         overnight_changes=overnight_changes,
         book=sort_book_by_attention(book),
         portfolio_health=portfolio_health,
+        unresearched_holdings=sorted(unresearched_holdings or [], key=lambda u: u.ticker),
         drift_warning=drift if (drift is not None and drift.stale) else None,
     )
 
@@ -183,6 +200,17 @@ def render_briefing_text(briefing: Briefing) -> str:
         for u in briefing.blocked.unpriced_positions:
             lines.append(f"  {u.ticker}: {u.error}")
         return "\n".join(lines)
+
+    if briefing.unresearched_holdings:
+        n = len(briefing.unresearched_holdings)
+        lines.append(f"🚨 NO RESEARCH COVERAGE — {n} held position(s) unmonitored this run:")
+        for u in briefing.unresearched_holdings:
+            lines.append(f"  {u.ticker}: {u.reason}")
+        lines.append(
+            "  These have no current conviction score: no thesis-decay trigger, no "
+            "conviction-scaled stop/profit thresholds. Treat as un-reviewed, not held-and-safe."
+        )
+        lines.append("")
 
     if briefing.drift_warning is not None:
         d = briefing.drift_warning
@@ -231,11 +259,12 @@ def render_briefing_text(briefing: Briefing) -> str:
     if not briefing.book:
         lines.append("(no open positions)")
     for b in briefing.book:
-        conv = (
-            f"conviction {b.conviction_now:.0f} (was {b.conviction_at_entry:.0f})"
-            if b.conviction_now is not None and b.conviction_at_entry is not None
-            else "conviction n/a"
-        )
+        if b.conviction_now is not None and b.conviction_at_entry is not None:
+            conv = f"conviction {b.conviction_now:.0f} (was {b.conviction_at_entry:.0f})"
+        elif b.no_research_coverage:
+            conv = "⚠ NO RESEARCH COVERAGE"
+        else:
+            conv = "conviction n/a"
         flag = "  ⚠ EXIT TRIGGERED" if b.has_exit_trigger else ""
         lines.append(
             f"{b.ticker:<6} qty={b.qty:g}  value=${b.value_usd:,.0f}  weight={b.weight_pct:.1f}%  "

@@ -19,11 +19,14 @@ def bars_payload(n=210, start=100.0, step=0.1):
     return [bar(f"2026-01-{(i % 28) + 1:02d}", start + i * step) for i in range(n)]
 
 
-def make_gateway(tmp_path, fmp_responses, prices=None, histories=None, cluster_overrides=None):
+def make_gateway(tmp_path, fmp_responses, prices=None, histories=None, yf_income=None, yf_cash_flow=None, cluster_overrides=None):
     """`prices`: {ticker: float}. `histories`: {ticker: list[dict rows]}.
+    `yf_income`/`yf_cash_flow`: {ticker: list[raw yfinance-shaped dict rows]}.
     Missing entries raise YFinanceError, mimicking a real lookup failure."""
     prices = prices or {}
     histories = histories or {}
+    yf_income = yf_income or {}
+    yf_cash_flow = yf_cash_flow or {}
 
     fmp_cache = FileCache(tmp_path / "fmp_cache")
     fmp_budget = DailyCallBudget(tmp_path / "fmp_budget.json", daily_limit=250, today_fn=lambda: "2026-08-25")
@@ -40,8 +43,21 @@ def make_gateway(tmp_path, fmp_responses, prices=None, histories=None, cluster_o
             raise YFinanceError(f"no history for {ticker}")
         return histories[ticker]
 
+    def income_fetcher(ticker):
+        if ticker not in yf_income:
+            raise YFinanceError(f"no income statement for {ticker}")
+        return yf_income[ticker]
+
+    def cash_flow_fetcher(ticker):
+        if ticker not in yf_cash_flow:
+            raise YFinanceError(f"no cash flow statement for {ticker}")
+        return yf_cash_flow[ticker]
+
     yf_cache = FileCache(tmp_path / "yf_cache")
-    yf_client = YFinanceClient(cache=yf_cache, price_fetcher=price_fetcher, history_fetcher=history_fetcher)
+    yf_client = YFinanceClient(
+        cache=yf_cache, price_fetcher=price_fetcher, history_fetcher=history_fetcher,
+        income_statement_raw_fetcher=income_fetcher, cash_flow_raw_fetcher=cash_flow_fetcher,
+    )
 
     gateway = LiveMarketDataGateway(fmp_client, yf_client, cluster_overrides=cluster_overrides)
     return gateway, fmp_session
@@ -94,6 +110,39 @@ class TestGetScreenerInput:
         result = gateway.get_screener_input("VTI", is_held=True)
         assert result.technical.last_price is not None  # yfinance bars flowed through for an FMP-quote-gated ETF
         assert result.technical.sma_200 is not None
+
+    def test_falls_back_to_yfinance_when_fmp_fundamentals_402(self, tmp_path):
+        # regression test for the second real-account discovery: FMP gates
+        # income-statement/cash-flow-statement the same way it gates quote
+        responses = {
+            "profile#CEG": FakeResponse(payload=[{"symbol": "CEG", "mktCap": 90_000_000_000, "volAvg": 2_000_000}]),
+            "quote#CEG": FakeResponse(status_code=402, text="Restricted Endpoint"),
+            "income-statement#CEG": FakeResponse(status_code=402, text="Restricted Endpoint"),
+            "cash-flow-statement#CEG": FakeResponse(status_code=402, text="Restricted Endpoint"),
+        }
+        gateway, session = make_gateway(
+            tmp_path, responses,
+            prices={"CEG": 278.42},
+            histories={"CEG": bars_payload(start=250.0), "SPY": bars_payload(start=500.0, step=0.05)},
+            yf_income={"CEG": [{"date": "2026-01-01", "Total Revenue": 1000.0}, {"date": "2025-01-01", "Total Revenue": 900.0}]},
+            yf_cash_flow={"CEG": [{"date": "2026-01-01", "Free Cash Flow": 300.0}]},
+        )
+        result = gateway.get_screener_input("CEG", is_held=True)
+        assert result.free_cash_flow == 300.0
+        assert result.revenue_growth_pct == pytest.approx((1000.0 - 900.0) / 900.0 * 100)
+
+    def test_raises_when_both_fmp_and_yfinance_fundamentals_fail(self, tmp_path):
+        responses = {
+            "profile#CEG": FakeResponse(payload=[{"symbol": "CEG"}]),
+            "quote#CEG": FakeResponse(status_code=402, text="Restricted Endpoint"),
+            "income-statement#CEG": FakeResponse(status_code=402, text="Restricted Endpoint"),
+            "cash-flow-statement#CEG": FakeResponse(status_code=402, text="Restricted Endpoint"),
+        }
+        gateway, session = make_gateway(
+            tmp_path, responses, prices={"CEG": 278.42}, histories={"CEG": bars_payload(), "SPY": bars_payload(start=500.0, step=0.05)}
+        )
+        with pytest.raises(RuntimeError, match="income statement unavailable"):
+            gateway.get_screener_input("CEG", is_held=True)
 
     def test_revenue_growth_computed_from_two_periods(self, tmp_path):
         gateway, session = make_gateway(
@@ -186,6 +235,20 @@ class TestGetResearchContext:
         assert "Technology" in text
         assert "Technical snapshot" in text
         assert "150.0" in text  # yfinance price appears, not a bare FMP quote
+        assert "source=fmp" in text  # FMP worked here, no fallback needed
+
+    def test_context_names_yfinance_fallback_when_fmp_fundamentals_fail(self, tmp_path):
+        responses = self._base_responses()
+        responses["income-statement"] = FakeResponse(status_code=402, text="Restricted Endpoint")
+        responses["cash-flow-statement"] = FakeResponse(status_code=402, text="Restricted Endpoint")
+        gateway, session = make_gateway(
+            tmp_path, responses, prices={"AMD": 150.0}, histories=self._histories(),
+            yf_income={"AMD": [{"date": "2026-01-01", "Total Revenue": 1100.0}]},
+            yf_cash_flow={"AMD": [{"date": "2026-01-01", "Free Cash Flow": 200.0}]},
+        )
+        text = gateway.get_research_context("AMD")
+        assert "source=yfinance_fallback" in text
+        assert "1100.0" in text  # the fallback data actually made it into the text
 
     def test_13f_and_insider_and_price_failures_degrade_gracefully(self, tmp_path):
         responses = self._base_responses()

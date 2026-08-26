@@ -440,3 +440,72 @@ class TestPricingGate:
         # AMD's value made it into NAV; NBIS (unpriced) silently didn't —
         # a tolerated failure still means NAV understates the true book
         assert [b.ticker for b in briefing.book] == ["AMD"]
+
+
+class TestUnresearchedHoldings:
+    def test_stage1_fetch_failure_flags_the_holding(self, session, portfolio, tmp_path):
+        portfolio.add_manual_position("NBIS", qty=4, avg_cost=192.0, conviction_at_entry=68.0)
+        # no "NBIS" entry in inputs -> get_screener_input raises KeyError
+        gateway = FakeGateway(inputs={}, prices={"NBIS": 222.0})
+        llm = make_llm(tmp_path, [])
+        config = make_config()
+        run_inputs = NightlyRunInputs(
+            as_of=dt.datetime(2026, 8, 25, 22, 0, 0),
+            universe_tickers=build_universe(held_tickers=["NBIS"], watchlist=[], scan_tickers=[]),
+            held_tickers=["NBIS"],
+            cash=usd(100.0),
+        )
+
+        briefing = run_nightly(session=session, config=config, gateway=gateway, llm=llm, portfolio=portfolio, inputs=run_inputs)
+
+        assert [u.ticker for u in briefing.unresearched_holdings] == ["NBIS"]
+        assert "Stage 1 data fetch failed" in briefing.unresearched_holdings[0].reason
+        assert briefing.book[0].no_research_coverage is True
+
+    def test_research_context_failure_flags_the_holding_and_suppresses_thesis_decay(self, session, portfolio, tmp_path):
+        # A real conviction_at_entry (68) that WOULD read as thesis decay if
+        # a fabricated "now" score were compared against it — this test
+        # exists to keep that guarantee from silently regressing.
+        portfolio.add_manual_position("NBIS", qty=4, avg_cost=192.0, conviction_at_entry=68.0)
+        gateway = FakeGateway(
+            inputs={"NBIS": screener_input("NBIS", is_held=True)},
+            prices={"NBIS": 200.0},
+            context_failures={"NBIS"},
+        )
+        script = [FakeResponse(parsed_output=Stage2Verdict(verdict="x", material=False))]
+        llm = make_llm(tmp_path, script)
+        config = make_config()
+        run_inputs = NightlyRunInputs(
+            as_of=dt.datetime(2026, 8, 25, 22, 0, 0),
+            universe_tickers=build_universe(held_tickers=["NBIS"], watchlist=[], scan_tickers=[]),
+            held_tickers=["NBIS"],
+            cash=usd(100.0),
+        )
+
+        briefing = run_nightly(session=session, config=config, gateway=gateway, llm=llm, portfolio=portfolio, inputs=run_inputs)
+
+        assert [u.ticker for u in briefing.unresearched_holdings] == ["NBIS"]
+        assert "Research context fetch failed" in briefing.unresearched_holdings[0].reason
+        assert briefing.book[0].no_research_coverage is True
+        assert briefing.book[0].has_exit_trigger is False  # no thesis-decay fired despite conviction_at_entry=68
+
+    def test_banner_and_flag_absent_when_research_succeeds(self, session, portfolio, tmp_path):
+        portfolio.add_manual_position("NBIS", qty=4, avg_cost=192.0, conviction_at_entry=68.0)
+        gateway = FakeGateway(inputs={"NBIS": screener_input("NBIS", is_held=True)}, prices={"NBIS": 200.0})
+        script = [
+            FakeResponse(parsed_output=Stage2Verdict(verdict="x", material=False)),
+            FakeResponse(parsed_output=memo(subscore=60.0)),
+        ]
+        llm = make_llm(tmp_path, script)
+        config = make_config()
+        run_inputs = NightlyRunInputs(
+            as_of=dt.datetime(2026, 8, 25, 22, 0, 0),
+            universe_tickers=build_universe(held_tickers=["NBIS"], watchlist=[], scan_tickers=[]),
+            held_tickers=["NBIS"],
+            cash=usd(100.0),
+        )
+
+        briefing = run_nightly(session=session, config=config, gateway=gateway, llm=llm, portfolio=portfolio, inputs=run_inputs)
+
+        assert briefing.unresearched_holdings == []
+        assert briefing.book[0].no_research_coverage is False

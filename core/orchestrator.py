@@ -51,6 +51,7 @@ from core.briefing import (
     OvernightChange,
     PortfolioHealth,
     UnpricedPosition,
+    UnresearchedHolding,
     WatchlistItem as BriefingWatchlistItem,
     assemble_blocked_briefing,
     assemble_briefing,
@@ -226,6 +227,15 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
             inputs.as_of, unpriced, tolerance=config.risk.max_unpriced_held_positions, total_held=len(held_positions)
         )
 
+    # research_gap_reason tracks, per ticker, why a HELD position ended up
+    # with no conviction score this run — populated at each of the three
+    # points research coverage can fall through (Stage 1 input fetch,
+    # research context fetch, the research LLM call itself). Surfaced as a
+    # top-of-briefing warning below, per the user's explicit request: a
+    # held position with no conviction score is unmonitored, and that must
+    # be impossible to miss, not just an "n/a" in a table.
+    research_gap_reason: dict[str, str] = {}
+
     # ---------------------------------------------------------------- Stage 1
     screener_inputs: dict[str, ScreenerInput] = {}
     for ticker in inputs.universe_tickers:
@@ -234,6 +244,7 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
         except Exception as exc:  # noqa: BLE001 — one bad data fetch must not kill the run
             session.add(RiskEvent(run_id=run_row.id, type="DATA_FETCH_FAILED", detail_json=json.dumps({"ticker": ticker, "stage": "stage1_input", "error": str(exc)})))
             logger.warning("stage1 input fetch failed ticker=%s error=%s", ticker, exc)
+            research_gap_reason[ticker] = f"Stage 1 data fetch failed: {exc}"
 
     stage1_results = run_stage1(list(screener_inputs.values()), config.screener.stage1)
     stage1_by_ticker = {r.ticker: r for r in stage1_results}
@@ -274,6 +285,7 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
         except Exception as exc:  # noqa: BLE001 — one bad context fetch must not skip a Sonnet call for nothing, or kill the run
             session.add(RiskEvent(run_id=run_row.id, type="DATA_FETCH_FAILED", detail_json=json.dumps({"ticker": r.ticker, "stage": "research_context", "error": str(exc)})))
             logger.warning("research context fetch failed ticker=%s error=%s", r.ticker, exc)
+            research_gap_reason[r.ticker] = f"Research context fetch failed: {exc}"
             continue
         research_contexts.append(ResearchContext(ticker=r.ticker, context_text=context_text))
     research_results = run_research_batch(llm, research_contexts, config.research)
@@ -284,6 +296,7 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
         if not rr.ok:
             session.add(RiskEvent(run_id=run_row.id, type="RESEARCH_FAILED", detail_json=json.dumps({"ticker": rr.ticker, "error": rr.error})))
             logger.warning("research failed ticker=%s error=%s", rr.ticker, rr.error)
+            research_gap_reason[rr.ticker] = f"Research call failed: {rr.error}"
             continue
 
         memo = rr.memo
@@ -368,7 +381,10 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
 
         screener_input = screener_inputs.get(pos.ticker)
         atr_14 = screener_input.technical.atr_14 if screener_input else None
+        has_fresh_conviction = pos.ticker in conviction_by_ticker
         conviction_now = conviction_by_ticker.get(pos.ticker, pos.conviction_at_entry or 50.0)
+        if not has_fresh_conviction:
+            research_gap_reason.setdefault(pos.ticker, "no research coverage this run")
 
         evaluation = evaluate_held_position(
             ticker=pos.ticker,
@@ -377,7 +393,20 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
             peak_price=pos.peak_price_since_activation,
             atr_14=atr_14,
             conviction_now=conviction_now,
-            conviction_at_entry=pos.conviction_at_entry,
+            # Only pass a real conviction_at_entry when conviction_now is
+            # also real this run. Without this, when unresearched,
+            # conviction_now's fallback above (`pos.conviction_at_entry or
+            # 50.0`) is self-referential when conviction_at_entry is set —
+            # it already produces drop=0 (no false trigger) by coincidence,
+            # not by a check that says so. Making it explicit here means
+            # thesis-decay's "no signal without real research" guarantee
+            # holds by construction, not by an accident of how the fallback
+            # happens to be written — the fallback logic could change later
+            # without anyone noticing it was quietly relied upon for this.
+            # Trailing-stop/profit-band still use the fallback conviction_now
+            # for scaling — those only need *some* reasonable basis, not a
+            # fresh one, unlike thesis-decay's entry-vs-now comparison.
+            conviction_at_entry=pos.conviction_at_entry if has_fresh_conviction else None,
             scaling=config.conviction_scaling,
             config=config.risk,
         )
@@ -422,6 +451,7 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
                 conviction_at_entry=pos.conviction_at_entry,
                 distance_to_trailing_stop_pct=_distance_to_stop_pct(evaluation, current_price),
                 has_exit_trigger=evaluation.has_exit_signal,
+                no_research_coverage=not has_fresh_conviction,
             )
         )
     session.flush()
@@ -514,6 +544,9 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
             kill_switch=kill_status,
         ),
         drift=portfolio.check_drift(as_of=inputs.as_of),
+        unresearched_holdings=[
+            UnresearchedHolding(ticker=t, reason=r) for t, r in research_gap_reason.items() if t in held_set
+        ],
     )
     return briefing
 

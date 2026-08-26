@@ -9,6 +9,7 @@ from core.briefing import (
     OvernightChange,
     PortfolioHealth,
     UnpricedPosition,
+    UnresearchedHolding,
     WatchlistItem,
     assemble_blocked_briefing,
     assemble_briefing,
@@ -36,7 +37,7 @@ def order(ticker="AMD", conviction=50, action="BUY"):
     )
 
 
-def book_entry(ticker="AMD", weight_pct=5.0, conviction_now=None, conviction_at_entry=None, has_exit_trigger=False):
+def book_entry(ticker="AMD", weight_pct=5.0, conviction_now=None, conviction_at_entry=None, has_exit_trigger=False, no_research_coverage=False):
     return BookEntry(
         ticker=ticker,
         qty=10,
@@ -46,6 +47,7 @@ def book_entry(ticker="AMD", weight_pct=5.0, conviction_now=None, conviction_at_
         conviction_now=conviction_now,
         conviction_at_entry=conviction_at_entry,
         has_exit_trigger=has_exit_trigger,
+        no_research_coverage=no_research_coverage,
     )
 
 
@@ -208,3 +210,53 @@ class TestRenderBlockedBriefing:
         assert "402 Restricted Endpoint" in text
         assert "Actions today" not in text  # normal sections are skipped entirely
         assert "Your book" not in text
+
+
+class TestUnresearchedHoldings:
+    def base_kwargs(self, **overrides):
+        kwargs = dict(
+            generated_at=NOW, actions_today=[], watching=[], overnight_changes=[],
+            book=[], portfolio_health=PortfolioHealth(), drift=None,
+        )
+        kwargs.update(overrides)
+        return kwargs
+
+    def test_sorted_alphabetically_regardless_of_input_order(self):
+        holdings = [UnresearchedHolding(ticker="MP", reason="x"), UnresearchedHolding(ticker="CEG", reason="y")]
+        briefing = assemble_briefing(**self.base_kwargs(unresearched_holdings=holdings))
+        assert [u.ticker for u in briefing.unresearched_holdings] == ["CEG", "MP"]
+
+    def test_defaults_to_empty(self):
+        briefing = assemble_briefing(**self.base_kwargs())
+        assert briefing.unresearched_holdings == []
+
+    def test_banner_appears_at_top_before_actions_and_book(self):
+        holdings = [UnresearchedHolding(ticker="CEG", reason="Stage 1 data fetch failed: 402")]
+        book = [book_entry("CEG", no_research_coverage=True)]
+        briefing = assemble_briefing(**self.base_kwargs(unresearched_holdings=holdings, book=book))
+        text = render_briefing_text(briefing)
+        assert "NO RESEARCH COVERAGE" in text
+        assert "CEG: Stage 1 data fetch failed: 402" in text
+        # the banner appears before the normal section headers
+        assert text.index("NO RESEARCH COVERAGE") < text.index("--- Actions today ---")
+        assert text.index("NO RESEARCH COVERAGE") < text.index("--- Your book ---")
+
+    def test_no_banner_when_no_unresearched_holdings(self):
+        briefing = assemble_briefing(**self.base_kwargs())
+        text = render_briefing_text(briefing)
+        assert "NO RESEARCH COVERAGE" not in text
+
+    def test_book_row_shows_flag_instead_of_generic_na(self):
+        book = [book_entry("CEG", no_research_coverage=True)]
+        briefing = assemble_briefing(**self.base_kwargs(book=book))
+        text = render_briefing_text(briefing)
+        assert "⚠ NO RESEARCH COVERAGE" in text
+        assert "conviction n/a" not in text
+
+    def test_ordinary_missing_conviction_without_flag_still_shows_na(self):
+        # distinguishes "genuinely not researched this run" from any other
+        # reason a position might lack a score, without over-claiming
+        book = [book_entry("CEG", no_research_coverage=False)]
+        briefing = assemble_briefing(**self.base_kwargs(book=book))
+        text = render_briefing_text(briefing)
+        assert "conviction n/a" in text

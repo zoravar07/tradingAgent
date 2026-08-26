@@ -17,6 +17,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class PortfolioConfig(BaseModel):
     import_reminder_days: int = 7
+    # Default is conservative (whole shares only) for a fresh config; governs
+    # manual entry / mark-filled recording only, not Order Builder's output
+    # (always whole-share by construction, see agents/order_builder.py) —
+    # override to True in config.yaml for an account that trades fractional
+    # shares, as this codebase's own config.yaml does.
     allow_fractional: bool = False
 
 
@@ -92,6 +97,13 @@ class RiskConfig(BaseModel):
     reference_atr_pct_of_price: float = 3.0
     min_volatility_size_multiplier: float = 0.25
     thesis_decay_trigger_pts: float = 15.0
+    # User-requested hard gate, not in the spec: NAV is only as good as
+    # every held position being priced. Zero tolerance by default — if more
+    # than this many held positions can't be priced, the whole run halts
+    # with zero proposals rather than publish a briefing built on a NAV
+    # that's silently missing part of the book. See core/orchestrator.py's
+    # module docstring.
+    max_unpriced_held_positions: int = 0
 
 
 class ResearchConfig(BaseModel):

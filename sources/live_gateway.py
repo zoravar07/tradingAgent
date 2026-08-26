@@ -1,7 +1,18 @@
-"""FmpMarketDataGateway — a real, network-backed implementation of
-core.orchestrator.MarketDataGateway, wired to a real FMPClient (§10 step 3).
-Every gateway used elsewhere in this codebase (all of tests/) is a fake;
-this is the one piece of code that actually calls FMP when it's used.
+"""LiveMarketDataGateway — a real, network-backed implementation of
+core.orchestrator.MarketDataGateway (§10 step 3, extended). Every gateway
+used elsewhere in this codebase (all of tests/) is a fake; this is the one
+piece of code that actually calls external APIs when it's used.
+
+**Composite by design, not a single provider.** The first live run
+discovered that this account's FMP plan gates the `quote` endpoint to a
+small set of large-cap tickers — every ETF and several smaller holdings
+402'd, which silently understated NAV (positions with no price contribute
+nothing to it). Current price and historical bars now come from
+sources/yfinance_source.py (free, no key, confirmed to cover every ticker
+FMP's quote endpoint rejected). Fundamentals, earnings, analyst estimates,
+and 13F/insider data stay on FMPClient — that part of the integration
+worked fine and there's no reason to replace it. `get_sector` also stays on
+FMP's profile endpoint, which was never gated (only `quote` was).
 
 Known gaps, flagged rather than silently guessed at:
 
@@ -15,7 +26,7 @@ Known gaps, flagged rather than silently guessed at:
 * Sector relative strength (`relative_strength_vs_sector_pct`) is always
   None — there's no ticker-to-sector-ETF mapping anywhere in the spec or
   config. `relative_strength_vs_spy_pct` (the other §5.1 benchmark) is
-  computed normally.
+  computed normally, from yfinance bars.
 * Every FMP field access uses `.get()` with a None fallback rather than
   asserting a field exists — the free tier's exact response shape wasn't
   verified line-by-line before this was written. A missing field degrades
@@ -28,9 +39,8 @@ from __future__ import annotations
 from agents.screener import ScreenerInput
 from core.orchestrator import MarketDataGateway
 from sources.fmp import FMPClient
-from sources.prices import compute_technical_snapshot, fetch_bars
-
-HISTORICAL_LOOKBACK_DAYS = 400  # enough trading history for a 200-DMA + a year of ATR percentile
+from sources.prices import compute_technical_snapshot
+from sources.yfinance_source import YFinanceClient
 
 
 def _latest_revenue_growth_pct(income_statements: list[dict]) -> float | None:
@@ -44,23 +54,24 @@ def _latest_revenue_growth_pct(income_statements: list[dict]) -> float | None:
     return (latest - prior) / prior * 100
 
 
-class FmpMarketDataGateway:
-    def __init__(self, client: FMPClient, cluster_overrides: dict[str, str] | None = None):
-        self.client = client
+class LiveMarketDataGateway:
+    def __init__(self, fmp_client: FMPClient, yf_client: YFinanceClient, cluster_overrides: dict[str, str] | None = None):
+        self.fmp = fmp_client
+        self.yf = yf_client
         self.cluster_overrides = {k.upper(): v for k, v in (cluster_overrides or {}).items()}
-        self._spy_bars_cache = None  # FMPClient itself caches the HTTP call; this avoids re-parsing per ticker
+        self._spy_bars_cache = None  # YFinanceClient itself caches the fetch; this avoids re-parsing per ticker
 
     def _spy_bars(self):
         if self._spy_bars_cache is None:
-            self._spy_bars_cache = fetch_bars(self.client, "SPY")
+            self._spy_bars_cache = self.yf.get_historical_bars("SPY")
         return self._spy_bars_cache
 
     @staticmethod
     def _safe(fetch_fn, default):
-        """Run one FMP call; on failure, return `default` with the error
-        folded in (a dict gets an "error" key, a list gets one error entry)
-        rather than propagating — a single unavailable field must not take
-        down the whole research context."""
+        """Run one call; on failure, return `default` with the error folded
+        in (a dict gets an "error" key, a list gets one error entry) rather
+        than propagating — a single unavailable field must not take down
+        the whole research context."""
         try:
             return fetch_fn()
         except Exception as exc:  # noqa: BLE001
@@ -73,15 +84,19 @@ class FmpMarketDataGateway:
     # ------------------------------------------------------------ screener
 
     def get_screener_input(self, ticker: str, is_held: bool) -> ScreenerInput:
-        profile = self.client.get_profile(ticker)
-        quote = self.client.get_quote(ticker)
-        income = self.client.get_income_statement(ticker, limit=2)
-        cash_flow = self.client.get_cash_flow_statement(ticker, limit=1)
-        bars = fetch_bars(self.client, ticker)
+        profile = self.fmp.get_profile(ticker)
+        # FMP's quote 402s for a meaningful fraction of real tickers on this
+        # plan (confirmed live) — used here only for supplementary fields
+        # (P/E, avg volume fallback); price itself comes from yfinance below,
+        # so a quote failure degrades this ticker's data, doesn't drop it.
+        quote = self._safe(lambda: self.fmp.get_quote(ticker), {})
+        income = self.fmp.get_income_statement(ticker, limit=2)
+        cash_flow = self.fmp.get_cash_flow_statement(ticker, limit=1)
+        bars = self.yf.get_historical_bars(ticker)
 
         technical = compute_technical_snapshot(bars, spy_bars=self._spy_bars(), sector_bars=None)
 
-        price = quote.get("price") or profile.get("price")
+        price = self.yf.get_current_price(ticker)
         avg_volume = profile.get("volAvg") or quote.get("avgVolume")
         adv_usd = (avg_volume * price) if (avg_volume and price) else None
 
@@ -104,29 +119,30 @@ class FmpMarketDataGateway:
     def get_research_context(self, ticker: str) -> str:
         # Every field fetch is defensive — confirmed empirically during
         # development that even "core" resources (earnings-surprises,
-        # insider-trading) can 404 on a real account while others (profile,
-        # income-statement) work fine, and 13F can 402 on a free-tier plan.
-        # One bad sub-fetch degrades that field to an error note, not a
-        # crashed memo — this is what makes it safe for the orchestrator to
-        # call this per-ticker without its own try/except around every field.
-        profile = self._safe(lambda: self.client.get_profile(ticker), {})
-        quote = self._safe(lambda: self.client.get_quote(ticker), {})
-        income = self._safe(lambda: self.client.get_income_statement(ticker, limit=3), [])
-        cash_flow = self._safe(lambda: self.client.get_cash_flow_statement(ticker, limit=3), [])
-        earnings = self._safe(lambda: self.client.get_earnings_surprises(ticker, limit=4), [])
-        estimates = self._safe(lambda: self.client.get_analyst_estimates(ticker, limit=2), [])
-        price_target = self._safe(lambda: self.client.get_price_target_summary(ticker), {})
-        ownership = self._safe(lambda: self.client.get_institutional_ownership(ticker), [])
-        insider = self._safe(lambda: self.client.get_insider_trading(ticker, limit=20), [])
+        # insider-trading, quote itself) can fail on a real account while
+        # others (profile, income-statement) work fine. One bad sub-fetch
+        # degrades that field to an error note, not a crashed memo — this is
+        # what makes it safe for the orchestrator to call this per-ticker
+        # without its own try/except around every field.
+        profile = self._safe(lambda: self.fmp.get_profile(ticker), {})
+        quote = self._safe(lambda: self.fmp.get_quote(ticker), {})
+        income = self._safe(lambda: self.fmp.get_income_statement(ticker, limit=3), [])
+        cash_flow = self._safe(lambda: self.fmp.get_cash_flow_statement(ticker, limit=3), [])
+        earnings = self._safe(lambda: self.fmp.get_earnings_surprises(ticker, limit=4), [])
+        estimates = self._safe(lambda: self.fmp.get_analyst_estimates(ticker, limit=2), [])
+        price_target = self._safe(lambda: self.fmp.get_price_target_summary(ticker), {})
+        ownership = self._safe(lambda: self.fmp.get_institutional_ownership(ticker), [])
+        insider = self._safe(lambda: self.fmp.get_insider_trading(ticker, limit=20), [])
+        current_price = self._safe(lambda: self.yf.get_current_price(ticker), None)
 
-        bars = fetch_bars(self.client, ticker)
+        bars = self.yf.get_historical_bars(ticker)
         technical = compute_technical_snapshot(bars, spy_bars=self._spy_bars(), sector_bars=None)
 
         lines = [
             f"Company: {profile.get('companyName', ticker)} ({ticker})",
             f"Sector: {profile.get('sector')} / Industry: {profile.get('industry')}",
             f"Market cap: {profile.get('mktCap')}",
-            f"Price: {quote.get('price')}  P/E: {profile.get('pe')}",
+            f"Price: {current_price}  P/E: {profile.get('pe')}",  # current_price from yfinance, not FMP quote
             f"Description: {profile.get('description', '')[:1000]}",
             "",
             f"Income statements (most recent first): {income}",
@@ -148,16 +164,12 @@ class FmpMarketDataGateway:
     # -------------------------------------------------------------- prices
 
     def get_current_price(self, ticker: str) -> float:
-        quote = self.client.get_quote(ticker)
-        price = quote.get("price")
-        if price is None:
-            raise ValueError(f"no price in FMP quote for {ticker}")
-        return float(price)
+        return self.yf.get_current_price(ticker)
 
     # ------------------------------------------------------- sector/cluster
 
     def get_sector(self, ticker: str) -> str | None:
-        return self.client.get_profile(ticker).get("sector")
+        return self.fmp.get_profile(ticker).get("sector")
 
     def get_cluster(self, ticker: str) -> str | None:
         return self.cluster_overrides.get(ticker.upper())

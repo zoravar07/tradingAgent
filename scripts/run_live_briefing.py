@@ -1,6 +1,8 @@
-"""One-off diagnostic script: a real, live end-to-end run against FMP and
-Anthropic, using whatever positions are already in data/zopro.db. Prints the
-assembled briefing as plain text and what the run cost.
+"""One-off diagnostic script: a real, live end-to-end run against FMP,
+yfinance, and Anthropic, using whatever positions are already in
+data/zopro.db. Prints the assembled briefing as plain text and what the run
+cost. Prices/historicals come from yfinance (free, uncapped); fundamentals/
+earnings/analysts/13F stay on FMP — see sources/live_gateway.py.
 
 This is NOT the app (main.py, the nightly scheduler, the API server) — it's
 for looking at pipeline output before there's a UI to show it in, and for
@@ -24,9 +26,14 @@ Usage:
     # see the resolved universe without spending anything:
     .venv/bin/python scripts/run_live_briefing.py --dry-run-universe
 
-Requires ANTHROPIC_API_KEY and FMP_API_KEY in zopro/.env. Every LLM call
-costs real money (billed against config.yaml's budget.monthly_api_cap_usd);
-FMP calls cost nothing on the free tier but count against the 250/day cap.
+Requires ANTHROPIC_API_KEY and FMP_API_KEY in zopro/.env (yfinance needs no
+key). Every LLM call costs real money (billed against config.yaml's
+budget.monthly_api_cap_usd); FMP calls cost nothing on the free tier but
+count against the 250/day cap; yfinance has no cap this codebase tracks.
+
+Note: config.risk.max_unpriced_held_positions defaults to 0 — if yfinance
+can't price even one held position, the run blocks before spending on
+Stage 1/2/Research and prints why, rather than publish on a broken NAV.
 """
 
 from __future__ import annotations
@@ -53,7 +60,8 @@ from core.money import usd  # noqa: E402
 from core.orchestrator import NightlyRunInputs, resolve_universe, run_nightly  # noqa: E402
 from core.portfolio import PortfolioService  # noqa: E402
 from sources.fmp import FMPClient  # noqa: E402
-from sources.live_gateway import FmpMarketDataGateway  # noqa: E402
+from sources.live_gateway import LiveMarketDataGateway  # noqa: E402
+from sources.yfinance_source import YFinanceClient  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -118,7 +126,9 @@ def main() -> None:
     if args.dry_run_universe:
         return
 
-    gateway = FmpMarketDataGateway(fmp_client, cluster_overrides=config.universe.cluster_overrides)
+    yf_cache = FileCache(ROOT / "data" / "yf_cache")
+    yf_client = YFinanceClient(cache=yf_cache)
+    gateway = LiveMarketDataGateway(fmp_client, yf_client, cluster_overrides=config.universe.cluster_overrides)
 
     anthropic_client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
     llm_budget = MonthlySpendTracker(ROOT / "data" / "llm_spend.json", config.budget.monthly_api_cap_usd)

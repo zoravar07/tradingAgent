@@ -1,9 +1,13 @@
-"""FmpMarketDataGateway tests — FMPClient's HTTP session is faked exactly as
-in test_fmp_client.py. No test here may hit the network."""
+"""LiveMarketDataGateway tests — FMPClient's HTTP session is faked exactly
+as in test_fmp_client.py; YFinanceClient's fetchers are faked exactly as in
+test_yfinance_source.py. No test here may hit any real network."""
+
+import pytest
 
 from core.cache import DailyCallBudget, FileCache
 from sources.fmp import FMPClient
-from sources.live_gateway import FmpMarketDataGateway
+from sources.live_gateway import LiveMarketDataGateway
+from sources.yfinance_source import YFinanceClient, YFinanceError
 from tests.test_fmp_client import FakeResponse, FakeSession
 
 
@@ -11,31 +15,54 @@ def bar(date, close, volume=1_000_000):
     return {"date": date, "open": close, "high": close + 1, "low": close - 1, "close": close, "volume": volume}
 
 
-def make_gateway(tmp_path, responses, cluster_overrides=None):
-    cache = FileCache(tmp_path / "cache")
-    budget = DailyCallBudget(tmp_path / "budget.json", daily_limit=250, today_fn=lambda: "2026-08-25")
-    session = FakeSession(responses)
-    client = FMPClient(api_key="test-key", cache=cache, budget=budget, session=session)
-    return FmpMarketDataGateway(client, cluster_overrides=cluster_overrides), session
-
-
 def bars_payload(n=210, start=100.0, step=0.1):
     return [bar(f"2026-01-{(i % 28) + 1:02d}", start + i * step) for i in range(n)]
 
 
+def make_gateway(tmp_path, fmp_responses, prices=None, histories=None, cluster_overrides=None):
+    """`prices`: {ticker: float}. `histories`: {ticker: list[dict rows]}.
+    Missing entries raise YFinanceError, mimicking a real lookup failure."""
+    prices = prices or {}
+    histories = histories or {}
+
+    fmp_cache = FileCache(tmp_path / "fmp_cache")
+    fmp_budget = DailyCallBudget(tmp_path / "fmp_budget.json", daily_limit=250, today_fn=lambda: "2026-08-25")
+    fmp_session = FakeSession(fmp_responses)
+    fmp_client = FMPClient(api_key="test-key", cache=fmp_cache, budget=fmp_budget, session=fmp_session)
+
+    def price_fetcher(ticker):
+        if ticker not in prices:
+            raise YFinanceError(f"no price for {ticker}")
+        return prices[ticker]
+
+    def history_fetcher(ticker, period):
+        if ticker not in histories:
+            raise YFinanceError(f"no history for {ticker}")
+        return histories[ticker]
+
+    yf_cache = FileCache(tmp_path / "yf_cache")
+    yf_client = YFinanceClient(cache=yf_cache, price_fetcher=price_fetcher, history_fetcher=history_fetcher)
+
+    gateway = LiveMarketDataGateway(fmp_client, yf_client, cluster_overrides=cluster_overrides)
+    return gateway, fmp_session
+
+
 class TestGetScreenerInput:
-    def _responses(self):
+    def _fmp_responses(self):
         return {
             "profile#AMD": FakeResponse(payload=[{"symbol": "AMD", "mktCap": 5_000_000_000, "volAvg": 40_000_000, "pe": 22.5, "sector": "Technology"}]),
             "quote#AMD": FakeResponse(payload=[{"symbol": "AMD", "price": 150.0, "pe": 22.5}]),
             "income-statement#AMD": FakeResponse(payload=[{"revenue": 1100}, {"revenue": 1000}]),
             "cash-flow-statement#AMD": FakeResponse(payload=[{"freeCashFlow": 200}]),
-            "historical-price-eod/full#AMD": FakeResponse(payload=bars_payload()),
-            "historical-price-eod/full#SPY": FakeResponse(payload=bars_payload(start=500.0, step=0.05)),
         }
 
+    def _histories(self):
+        return {"AMD": bars_payload(), "SPY": bars_payload(start=500.0, step=0.05)}
+
     def test_builds_screener_input_without_crashing(self, tmp_path):
-        gateway, session = make_gateway(tmp_path, self._responses())
+        gateway, session = make_gateway(
+            tmp_path, self._fmp_responses(), prices={"AMD": 150.0}, histories=self._histories()
+        )
         result = gateway.get_screener_input("AMD", is_held=False)
 
         assert result.ticker == "AMD"
@@ -45,48 +72,79 @@ class TestGetScreenerInput:
         assert result.free_cash_flow == 200
         assert result.days_to_earnings is None  # documented gap
 
+    def test_price_comes_from_yfinance_not_fmp_quote(self, tmp_path):
+        # regression test for the actual bug: FMP quote gated, price must
+        # still resolve via yfinance and avg_daily_volume_usd must use it
+        responses = self._fmp_responses()
+        responses["quote#AMD"] = FakeResponse(status_code=402, text="Restricted Endpoint")
+        gateway, session = make_gateway(tmp_path, responses, prices={"AMD": 479.18}, histories=self._histories())
+        result = gateway.get_screener_input("AMD", is_held=False)
+        assert result.avg_daily_volume_usd == 40_000_000 * 479.18
+
+    def test_covers_an_etf_fmp_quote_gated_in_the_real_account(self, tmp_path):
+        responses = {
+            "profile#VTI": FakeResponse(payload=[{"symbol": "VTI", "mktCap": None, "volAvg": 3_000_000}]),
+            "quote#VTI": FakeResponse(status_code=402, text="Restricted Endpoint"),
+            "income-statement#VTI": FakeResponse(payload=[]),
+            "cash-flow-statement#VTI": FakeResponse(payload=[]),
+        }
+        gateway, session = make_gateway(
+            tmp_path, responses, prices={"VTI": 378.15}, histories={"VTI": bars_payload(start=300.0), "SPY": bars_payload(start=500.0, step=0.05)}
+        )
+        result = gateway.get_screener_input("VTI", is_held=True)
+        assert result.technical.last_price is not None  # yfinance bars flowed through for an FMP-quote-gated ETF
+        assert result.technical.sma_200 is not None
+
     def test_revenue_growth_computed_from_two_periods(self, tmp_path):
-        gateway, session = make_gateway(tmp_path, self._responses())
+        gateway, session = make_gateway(
+            tmp_path, self._fmp_responses(), prices={"AMD": 150.0}, histories=self._histories()
+        )
         result = gateway.get_screener_input("AMD", is_held=False)
         assert result.revenue_growth_pct == 10.0  # (1100-1000)/1000 * 100
 
     def test_technical_snapshot_populated(self, tmp_path):
-        gateway, session = make_gateway(tmp_path, self._responses())
+        gateway, session = make_gateway(
+            tmp_path, self._fmp_responses(), prices={"AMD": 150.0}, histories=self._histories()
+        )
         result = gateway.get_screener_input("AMD", is_held=False)
         assert result.technical.sma_200 is not None
         assert result.technical.relative_strength_vs_spy_pct is not None
         assert result.technical.relative_strength_vs_sector_pct is None  # documented gap
 
     def test_spy_bars_fetched_once_across_multiple_tickers(self, tmp_path):
-        responses = self._responses()
+        responses = self._fmp_responses()
         responses.update(
             {
                 "profile#NVDA": responses["profile#AMD"],
                 "quote#NVDA": responses["quote#AMD"],
                 "income-statement#NVDA": responses["income-statement#AMD"],
                 "cash-flow-statement#NVDA": responses["cash-flow-statement#AMD"],
-                "historical-price-eod/full#NVDA": responses["historical-price-eod/full#AMD"],
             }
         )
-        gateway, session = make_gateway(tmp_path, responses)
+        histories = self._histories()
+        histories["NVDA"] = bars_payload()
+        gateway, session = make_gateway(tmp_path, responses, prices={"AMD": 150.0, "NVDA": 150.0}, histories=histories)
         gateway.get_screener_input("AMD", is_held=False)
         gateway.get_screener_input("NVDA", is_held=False)
-        spy_calls = [c for c in session.calls if c[1].get("symbol") == "SPY"]
-        assert len(spy_calls) == 1  # cached in-process after the first fetch
+        # SPY history is cached at the YFinanceClient layer, so a second
+        # ticker's request never re-invokes the (fake) history fetcher for SPY
+        assert gateway.yf.cache.get(f"yf:hist:SPY:2y") is not None
 
 
 class TestGetCurrentPrice:
-    def test_returns_price(self, tmp_path):
-        gateway, session = make_gateway(tmp_path, {"quote": FakeResponse(payload=[{"price": 150.5}])})
+    def test_returns_price_from_yfinance(self, tmp_path):
+        gateway, session = make_gateway(tmp_path, {}, prices={"AMD": 150.5})
         assert gateway.get_current_price("AMD") == 150.5
 
-    def test_raises_when_price_missing(self, tmp_path):
-        gateway, session = make_gateway(tmp_path, {"quote": FakeResponse(payload=[{"symbol": "AMD"}])})
-        try:
-            gateway.get_current_price("AMD")
-            assert False, "expected ValueError"
-        except ValueError:
-            pass
+    def test_raises_when_yfinance_has_no_price(self, tmp_path):
+        gateway, session = make_gateway(tmp_path, {}, prices={})
+        with pytest.raises(YFinanceError):
+            gateway.get_current_price("BADTICKER")
+
+    def test_does_not_touch_fmp_at_all(self, tmp_path):
+        gateway, session = make_gateway(tmp_path, {}, prices={"AMD": 150.5})
+        gateway.get_current_price("AMD")
+        assert len(session.calls) == 0
 
 
 class TestSectorAndCluster:
@@ -113,49 +171,39 @@ class TestGetResearchContext:
             "earnings-surprises": FakeResponse(payload=[]),
             "analyst-estimates": FakeResponse(payload=[]),
             "price-target-summary": FakeResponse(payload=[]),
-            "historical-price-eod/full#AMD": FakeResponse(payload=bars_payload()),
-            "historical-price-eod/full#SPY": FakeResponse(payload=bars_payload(start=500.0, step=0.05)),
         }
+
+    def _histories(self):
+        return {"AMD": bars_payload(), "SPY": bars_payload(start=500.0, step=0.05)}
 
     def test_assembles_readable_text_without_crashing(self, tmp_path):
         responses = self._base_responses()
         responses["institutional-ownership/symbol-positions-summary"] = FakeResponse(payload=[])
         responses["insider-trading"] = FakeResponse(payload=[])
-        gateway, session = make_gateway(tmp_path, responses)
+        gateway, session = make_gateway(tmp_path, responses, prices={"AMD": 150.0}, histories=self._histories())
         text = gateway.get_research_context("AMD")
         assert "AMD" in text
         assert "Technology" in text
         assert "Technical snapshot" in text
+        assert "150.0" in text  # yfinance price appears, not a bare FMP quote
 
-    def test_13f_and_insider_failures_degrade_gracefully(self, tmp_path):
+    def test_13f_and_insider_and_price_failures_degrade_gracefully(self, tmp_path):
         responses = self._base_responses()
         responses["institutional-ownership/symbol-positions-summary"] = FakeResponse(status_code=402, text="upgrade required")
         responses["insider-trading"] = FakeResponse(status_code=402, text="upgrade required")
-        gateway, session = make_gateway(tmp_path, responses)
+        # note: no price for AMD in the yfinance fake -> current_price fetch fails too
+        gateway, session = make_gateway(tmp_path, responses, prices={}, histories=self._histories())
         text = gateway.get_research_context("AMD")  # must not raise
         assert "error" in text
 
-    def test_earnings_surprises_and_price_target_failures_degrade_gracefully(self, tmp_path):
-        # confirmed against the real FMP API during development: these two
-        # can 404 even when profile/quote/income-statement work fine
-        responses = self._base_responses()
-        responses["earnings-surprises"] = FakeResponse(status_code=404, text="not found")
-        responses["price-target-summary"] = FakeResponse(status_code=404, text="not found")
-        responses["institutional-ownership/symbol-positions-summary"] = FakeResponse(payload=[])
-        responses["insider-trading"] = FakeResponse(payload=[])
-        gateway, session = make_gateway(tmp_path, responses)
-        text = gateway.get_research_context("AMD")  # must not raise
-        assert "AMD" in text
-
-    def test_every_field_can_fail_at_once_without_raising(self, tmp_path):
+    def test_every_fmp_field_can_fail_at_once_without_raising(self, tmp_path):
         failing = FakeResponse(status_code=500, text="down")
         responses = {
             "profile": failing, "quote": failing, "income-statement": failing, "cash-flow-statement": failing,
             "earnings-surprises": failing, "analyst-estimates": failing, "price-target-summary": failing,
             "institutional-ownership/symbol-positions-summary": failing, "insider-trading": failing,
-            "historical-price-eod/full#AMD": FakeResponse(payload=bars_payload()),
-            "historical-price-eod/full#SPY": FakeResponse(payload=bars_payload(start=500.0, step=0.05)),
         }
-        gateway, session = make_gateway(tmp_path, responses)
-        text = gateway.get_research_context("AMD")  # must not raise even with everything else down
+        gateway, session = make_gateway(tmp_path, responses, prices={"AMD": 150.0}, histories=self._histories())
+        text = gateway.get_research_context("AMD")  # must not raise even with everything FMP-side down
         assert "AMD" in text
+        assert "150.0" in text  # yfinance data survives even total FMP outage

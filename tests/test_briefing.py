@@ -8,7 +8,9 @@ from core.briefing import (
     BookEntry,
     OvernightChange,
     PortfolioHealth,
+    UnpricedPosition,
     WatchlistItem,
+    assemble_blocked_briefing,
     assemble_briefing,
     render_briefing_text,
     sort_actions_by_conviction,
@@ -171,3 +173,38 @@ class TestRenderBriefingText:
         )
         text = render_briefing_text(briefing)
         assert "DRIFT WARNING" in text
+
+
+class TestAssembleBlockedBriefing:
+    def test_reason_names_the_counts(self):
+        unpriced = [UnpricedPosition(ticker="CEG", error="402 restricted")]
+        briefing = assemble_blocked_briefing(NOW, unpriced, tolerance=0, total_held=16)
+        assert briefing.blocked is not None
+        assert "1/16" in briefing.blocked.reason
+        assert "tolerance: 0" in briefing.blocked.reason
+
+    def test_every_other_section_is_empty(self):
+        unpriced = [UnpricedPosition(ticker="CEG", error="402")]
+        briefing = assemble_blocked_briefing(NOW, unpriced, tolerance=0, total_held=16)
+        assert briefing.actions_today == []
+        assert briefing.watching == []
+        assert briefing.overnight_changes == []
+        assert briefing.book == []
+        assert briefing.drift_warning is None
+
+    def test_carries_the_unpriced_list(self):
+        unpriced = [UnpricedPosition(ticker="CEG", error="402"), UnpricedPosition(ticker="CLS", error="402")]
+        briefing = assemble_blocked_briefing(NOW, unpriced, tolerance=0, total_held=16)
+        assert briefing.blocked.unpriced_positions == unpriced
+
+
+class TestRenderBlockedBriefing:
+    def test_shows_blocked_banner_and_failures_not_normal_sections(self):
+        unpriced = [UnpricedPosition(ticker="CEG", error="402 Restricted Endpoint")]
+        briefing = assemble_blocked_briefing(NOW, unpriced, tolerance=0, total_held=16)
+        text = render_briefing_text(briefing)
+        assert "RUN BLOCKED" in text
+        assert "CEG" in text
+        assert "402 Restricted Endpoint" in text
+        assert "Actions today" not in text  # normal sections are skipped entirely
+        assert "Your book" not in text

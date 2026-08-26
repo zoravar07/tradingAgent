@@ -356,3 +356,87 @@ class TestFullNightlyRun:
         assert research_tickers == {"NVDA"}  # AMD dropped, NVDA still got researched
 
         assert [a.order.ticker for a in briefing.actions_today] == ["NVDA"]
+
+
+class TestPricingGate:
+    def test_unpriced_held_position_blocks_the_run_with_zero_tolerance(self, session, portfolio, tmp_path):
+        portfolio.add_manual_position("NBIS", qty=8, avg_cost=218.0, conviction_at_entry=68.0)
+        portfolio.add_manual_position("AMD", qty=3, avg_cost=150.0)
+
+        # NBIS has no price at all -> pricing gate must trip before anything else runs
+        gateway = FakeGateway(inputs={}, prices={"AMD": 150.0})
+        llm = make_llm(tmp_path, [])  # no LLM call should happen — script would error if one was attempted
+        config = make_config()
+        run_inputs = NightlyRunInputs(
+            as_of=dt.datetime(2026, 8, 25, 22, 0, 0),
+            universe_tickers=build_universe(held_tickers=["NBIS", "AMD"], watchlist=[], scan_tickers=[]),
+            held_tickers=["NBIS", "AMD"],
+            cash=usd(100.0),
+        )
+
+        briefing = run_nightly(session=session, config=config, gateway=gateway, llm=llm, portfolio=portfolio, inputs=run_inputs)
+
+        assert briefing.blocked is not None
+        assert briefing.blocked.unpriced_positions[0].ticker == "NBIS"
+        assert briefing.actions_today == []
+        assert briefing.book == []
+
+        run_row = session.execute(select(Run)).scalar_one()
+        assert run_row.status == "blocked"
+
+        # nothing downstream ran: no candidates, no research, no proposals, no NAV snapshot
+        assert session.execute(select(Candidate)).first() is None
+        assert session.execute(select(ResearchOutput)).first() is None
+        assert session.execute(select(Proposal)).first() is None
+        assert session.execute(select(NavSnapshot)).first() is None
+
+    def test_all_positions_priced_runs_normally(self, session, portfolio, tmp_path):
+        portfolio.add_manual_position("NBIS", qty=8, avg_cost=218.0, conviction_at_entry=68.0)
+        inputs_by_ticker = {"NBIS": screener_input("NBIS", is_held=True)}
+        gateway = FakeGateway(inputs=inputs_by_ticker, prices={"NBIS": 222.0})
+        script = [
+            FakeResponse(parsed_output=Stage2Verdict(verdict="x", material=False)),
+            FakeResponse(parsed_output=memo(subscore=50.0)),
+        ]
+        llm = make_llm(tmp_path, script)
+        config = make_config()
+        run_inputs = NightlyRunInputs(
+            as_of=dt.datetime(2026, 8, 25, 22, 0, 0),
+            universe_tickers=build_universe(held_tickers=["NBIS"], watchlist=[], scan_tickers=[]),
+            held_tickers=["NBIS"],
+            cash=usd(100.0),
+        )
+
+        briefing = run_nightly(session=session, config=config, gateway=gateway, llm=llm, portfolio=portfolio, inputs=run_inputs)
+
+        assert briefing.blocked is None
+        run_row = session.execute(select(Run)).scalar_one()
+        assert run_row.status == "succeeded"
+
+    def test_tolerance_above_zero_lets_the_run_through(self, session, portfolio, tmp_path):
+        portfolio.add_manual_position("NBIS", qty=8, avg_cost=218.0, conviction_at_entry=68.0)
+        portfolio.add_manual_position("AMD", qty=3, avg_cost=150.0)
+
+        gateway = FakeGateway(inputs={"AMD": screener_input("AMD", is_held=True)}, prices={"AMD": 150.0})
+        script = [
+            FakeResponse(parsed_output=Stage2Verdict(verdict="x", material=False)),
+            FakeResponse(parsed_output=memo(subscore=50.0)),
+        ]
+        llm = make_llm(tmp_path, script)
+        config = make_config()
+        config.risk.max_unpriced_held_positions = 1  # tolerate the one NBIS pricing failure
+        run_inputs = NightlyRunInputs(
+            as_of=dt.datetime(2026, 8, 25, 22, 0, 0),
+            universe_tickers=build_universe(held_tickers=["NBIS", "AMD"], watchlist=[], scan_tickers=[]),
+            held_tickers=["NBIS", "AMD"],
+            cash=usd(100.0),
+        )
+
+        briefing = run_nightly(session=session, config=config, gateway=gateway, llm=llm, portfolio=portfolio, inputs=run_inputs)
+
+        assert briefing.blocked is None
+        run_row = session.execute(select(Run)).scalar_one()
+        assert run_row.status == "succeeded"
+        # AMD's value made it into NAV; NBIS (unpriced) silently didn't —
+        # a tolerated failure still means NAV understates the true book
+        assert [b.ticker for b in briefing.book] == ["AMD"]

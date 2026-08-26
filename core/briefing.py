@@ -77,6 +77,25 @@ class PortfolioHealth:
 
 
 @dataclass
+class UnpricedPosition:
+    ticker: str
+    error: str
+
+
+@dataclass
+class BlockedStatus:
+    """Not in §3 — added per the user's explicit request: if too many held
+    positions can't be priced, NAV/weights/risk checks are meaningless, so
+    the run halts with zero proposals rather than publish a confident-
+    looking briefing built on a broken NAV. See core/orchestrator.py's
+    pricing gate, run *before* Stage 1 so a run that's going to be blocked
+    never spends on screening/research it can't use."""
+
+    reason: str
+    unpriced_positions: list[UnpricedPosition]
+
+
+@dataclass
 class Briefing:
     generated_at: dt.datetime
     actions_today: list[ActionItem]
@@ -85,6 +104,7 @@ class Briefing:
     book: list[BookEntry]
     portfolio_health: PortfolioHealth
     drift_warning: DriftStatus | None = None
+    blocked: BlockedStatus | None = None
 
 
 def sort_actions_by_conviction(items: list[ActionItem]) -> list[ActionItem]:
@@ -124,6 +144,29 @@ def assemble_briefing(
     )
 
 
+def assemble_blocked_briefing(
+    generated_at: dt.datetime, unpriced: list[UnpricedPosition], tolerance: int, total_held: int
+) -> Briefing:
+    """The pricing gate's output when it trips. Every other section is
+    empty on purpose — NAV underlies weight/conviction/health, and NAV is
+    unknown here, so nothing else is trustworthy enough to show."""
+    reason = (
+        f"{len(unpriced)}/{total_held} held position(s) could not be priced this run "
+        f"(tolerance: {tolerance}). NAV, weights, and risk checks would be built on an "
+        f"incomplete book, so no proposals were generated."
+    )
+    return Briefing(
+        generated_at=generated_at,
+        actions_today=[],
+        watching=[],
+        overnight_changes=[],
+        book=[],
+        portfolio_health=PortfolioHealth(),
+        drift_warning=None,
+        blocked=BlockedStatus(reason=reason, unpriced_positions=unpriced),
+    )
+
+
 def render_briefing_text(briefing: Briefing) -> str:
     """Plain-text rendering of §3's five sections — a debug/CLI view for
     looking at pipeline output before there's a UI (step 10) to show it in.
@@ -131,6 +174,15 @@ def render_briefing_text(briefing: Briefing) -> str:
     lines: list[str] = []
     lines.append(f"=== ZOPRO BRIEFING — {briefing.generated_at:%Y-%m-%d %H:%M} ===")
     lines.append("")
+
+    if briefing.blocked is not None:
+        lines.append("🛑 RUN BLOCKED — no proposals generated")
+        lines.append(briefing.blocked.reason)
+        lines.append("")
+        lines.append("Unpriced positions:")
+        for u in briefing.blocked.unpriced_positions:
+            lines.append(f"  {u.ticker}: {u.error}")
+        return "\n".join(lines)
 
     if briefing.drift_warning is not None:
         d = briefing.drift_warning

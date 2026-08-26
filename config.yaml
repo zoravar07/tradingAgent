@@ -2,7 +2,13 @@ version: 1
 
 portfolio:
   import_reminder_days: 7        # warn if positions haven't been verified recently
-  allow_fractional: false        # you place orders manually — whole shares only
+  # Governs manual entry / mark-filled recording only — NOT Order Builder's
+  # output, which always produces whole-share BUY/exit quantities via
+  # floor()/int() math regardless of this flag (agents/order_builder.py).
+  # This account trades fractional shares (IBKR fractional-share investing),
+  # so existing holdings can be fractional even though every order Zopro
+  # itself proposes is whole-share by construction.
+  allow_fractional: true
 
 schedule:
   nightly_run: "0 22 * * 0-4"    # after US close, briefing ready by morning
@@ -82,6 +88,10 @@ risk:
   reference_atr_pct_of_price: 3.0   # ATR as % of price treated as "normal" volatility
   min_volatility_size_multiplier: 0.25  # a highly volatile name still gets >= 25% of its conviction-implied size
   thesis_decay_trigger_pts: 15.0    # conviction-point drop since entry that flags decay
+  # Not in the spec — added after a live run where a data-source gap
+  # silently zeroed out part of NAV. Zero tolerance: any held position that
+  # can't be priced halts the whole run rather than publish on a broken NAV.
+  max_unpriced_held_positions: 0
 
 conviction_weights:                 # auto-normalised; add or remove freely
   business_quality: 0.15

@@ -50,7 +50,9 @@ from core.briefing import (
     Briefing,
     OvernightChange,
     PortfolioHealth,
+    UnpricedPosition,
     WatchlistItem as BriefingWatchlistItem,
+    assemble_blocked_briefing,
     assemble_briefing,
 )
 from core.config import Config, UniverseConfig
@@ -170,10 +172,10 @@ def run_nightly(
 
     try:
         briefing = _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row)
-        run_row.status = "succeeded"
+        run_row.status = "blocked" if briefing.blocked is not None else "succeeded"
         run_row.finished_at = _utcnow()
         session.flush()
-        logger.info("run succeeded run_id=%s", run_row.id)
+        logger.info("run %s run_id=%s", run_row.status, run_row.id)
         return briefing
     except Exception as exc:
         run_row.status = "failed"
@@ -186,6 +188,43 @@ def run_nightly(
 
 def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> Briefing:
     held_set = {t.upper() for t in inputs.held_tickers}
+
+    # ------------------------------------------------------- Pricing gate (§0)
+    # Runs before anything else — including before Stage 1/2/Research, which
+    # cost real LLM money — because a run that's going to be blocked should
+    # never spend on screening/research it can't use. Zero tolerance by
+    # default (config.risk.max_unpriced_held_positions): NAV is the sum of
+    # every held position's market value, so even one missing price makes
+    # NAV, weights, sector/cluster exposure, and every risk gate built on
+    # them meaningless — a wrong-looking-confident briefing is worse than
+    # none (user's framing, and correct: the first live run silently
+    # understated NAV by more than half this way).
+    held_positions = portfolio.list_positions()
+    price_by_ticker: dict[str, float] = {}
+    unpriced: list[UnpricedPosition] = []
+    for pos in held_positions:
+        try:
+            price_by_ticker[pos.ticker] = gateway.get_current_price(pos.ticker)
+        except Exception as exc:  # noqa: BLE001 — collected, not raised; the gate below decides what happens
+            unpriced.append(UnpricedPosition(ticker=pos.ticker, error=str(exc)))
+
+    if len(unpriced) > config.risk.max_unpriced_held_positions:
+        for u in unpriced:
+            session.add(
+                RiskEvent(
+                    run_id=run_row.id, type="PRICING_GATE_BLOCKED",
+                    detail_json=json.dumps({"ticker": u.ticker, "error": u.error}),
+                )
+            )
+        session.flush()
+        logger.error(
+            "pricing gate blocked run: %d/%d held positions unpriced (tolerance=%d): %s",
+            len(unpriced), len(held_positions), config.risk.max_unpriced_held_positions,
+            ", ".join(u.ticker for u in unpriced),
+        )
+        return assemble_blocked_briefing(
+            inputs.as_of, unpriced, tolerance=config.risk.max_unpriced_held_positions, total_held=len(held_positions)
+        )
 
     # ---------------------------------------------------------------- Stage 1
     screener_inputs: dict[str, ScreenerInput] = {}
@@ -281,22 +320,18 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
     session.flush()
 
     # ------------------------------------------------- NAV, sector, cluster pass
-    # One pass over held positions to price them, then derive NAV/drawdown/
-    # daily-loss and the current sector/cluster exposure — all needed before
-    # the kill-switch check and the sizing gates that follow.
-    held_positions = portfolio.list_positions()
-    price_by_ticker: dict[str, float] = {}  # FMP quotes are always USD by construction — plain floats, not Money
-    position_values: list[Money] = []
+    # Prices were already fetched by the pricing gate above (and, in the
+    # default zero-tolerance config, that gate guarantees every held
+    # position is in price_by_ticker — this loop's `.get()` check only
+    # matters if max_unpriced_held_positions was raised above zero, letting
+    # some tolerated failures through). No re-fetching here.
+    position_values: list[Money] = []  # FMP quotes are always USD by construction — plain floats before wrapping
     sector_value: dict[str, Money] = {}
     cluster_value: dict[str, Money] = {}
     for pos in held_positions:
-        try:
-            price = gateway.get_current_price(pos.ticker)
-        except Exception as exc:  # noqa: BLE001
-            session.add(RiskEvent(run_id=run_row.id, type="DATA_FETCH_FAILED", detail_json=json.dumps({"ticker": pos.ticker, "stage": "current_price", "error": str(exc)})))
-            logger.warning("price fetch failed for held position ticker=%s error=%s", pos.ticker, exc)
-            continue
-        price_by_ticker[pos.ticker] = price
+        price = price_by_ticker.get(pos.ticker)
+        if price is None:
+            continue  # a tolerated failure (max_unpriced_held_positions > 0) — already recorded above
         value = usd(pos.qty * price)
         position_values.append(value)
         sector = gateway.get_sector(pos.ticker)

@@ -224,9 +224,15 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
     logger.info("stage2 survivors=%d/%d", len(stage2_survivors), len(stage2_results))
 
     # --------------------------------------------------------------- Research
-    research_contexts = [
-        ResearchContext(ticker=r.ticker, context_text=gateway.get_research_context(r.ticker)) for r in stage2_survivors
-    ]
+    research_contexts: list[ResearchContext] = []
+    for r in stage2_survivors:
+        try:
+            context_text = gateway.get_research_context(r.ticker)
+        except Exception as exc:  # noqa: BLE001 — one bad context fetch must not skip a Sonnet call for nothing, or kill the run
+            session.add(RiskEvent(run_id=run_row.id, type="DATA_FETCH_FAILED", detail_json=json.dumps({"ticker": r.ticker, "stage": "research_context", "error": str(exc)})))
+            logger.warning("research context fetch failed ticker=%s error=%s", r.ticker, exc)
+            continue
+        research_contexts.append(ResearchContext(ticker=r.ticker, context_text=context_text))
     research_results = run_research_batch(llm, research_contexts, config.research)
 
     conviction_by_ticker: dict[str, float] = {}

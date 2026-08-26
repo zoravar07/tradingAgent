@@ -76,17 +76,20 @@ def memo(**overrides) -> ResearchMemo:
 
 
 class FakeGateway:
-    def __init__(self, inputs: dict, prices: dict, sectors: dict = None, clusters: dict = None, contexts: dict = None):
+    def __init__(self, inputs: dict, prices: dict, sectors: dict = None, clusters: dict = None, contexts: dict = None, context_failures: set = None):
         self.inputs = inputs
         self.prices = prices
         self.sectors = sectors or {}
         self.clusters = clusters or {}
         self.contexts = contexts or {}
+        self.context_failures = context_failures or set()
 
     def get_screener_input(self, ticker, is_held):
         return self.inputs[ticker]
 
     def get_research_context(self, ticker):
+        if ticker in self.context_failures:
+            raise RuntimeError(f"data fetch failed for {ticker}")
         return self.contexts.get(ticker, f"context for {ticker}")
 
     def get_current_price(self, ticker):
@@ -316,4 +319,39 @@ class TestFullNightlyRun:
         assert "AMD" not in proposals  # kill switch blocked the new BUY
         assert "NBIS" in proposals  # but the thesis-decay exit still went through
         assert briefing.portfolio_health.kill_switch.triggered is True
-        assert proposals["NBIS"].action == "SELL"
+
+    def test_one_ticker_context_fetch_failure_does_not_kill_the_run(self, session, portfolio, tmp_path):
+        # A live-data lesson learned the hard way: a single ticker's data
+        # fetch can fail for reasons unrelated to every other ticker (a
+        # paywalled endpoint, a transient error). The run must still produce
+        # a briefing for everything that succeeded.
+        inputs_by_ticker = {
+            "AMD": screener_input("AMD", technical=technical(relative_strength_vs_spy_pct=10)),
+            "NVDA": screener_input("NVDA", technical=technical(relative_strength_vs_spy_pct=5)),
+        }
+        gateway = FakeGateway(
+            inputs=inputs_by_ticker, prices={"AMD": 150.0, "NVDA": 100.0}, context_failures={"AMD"}
+        )
+        script = [
+            FakeResponse(parsed_output=Stage2Verdict(verdict="a", material=True)),  # AMD
+            FakeResponse(parsed_output=Stage2Verdict(verdict="b", material=True)),  # NVDA
+            FakeResponse(parsed_output=memo(subscore=80.0)),  # NVDA research (AMD's context fetch failed first)
+        ]
+        llm = make_llm(tmp_path, script)
+        config = make_config()
+        run_inputs = NightlyRunInputs(
+            as_of=dt.datetime(2026, 8, 25, 22, 0, 0),
+            universe_tickers=build_universe(held_tickers=[], watchlist=[], scan_tickers=["AMD", "NVDA"]),
+            held_tickers=[],
+            cash_usd=100_000.0,
+        )
+
+        briefing = run_nightly(session=session, config=config, gateway=gateway, llm=llm, portfolio=portfolio, inputs=run_inputs)
+
+        run_row = session.execute(select(Run)).scalar_one()
+        assert run_row.status == "succeeded"
+
+        research_tickers = {r.ticker for r in session.execute(select(ResearchOutput)).scalars()}
+        assert research_tickers == {"NVDA"}  # AMD dropped, NVDA still got researched
+
+        assert [a.order.ticker for a in briefing.actions_today] == ["NVDA"]

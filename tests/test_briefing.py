@@ -10,6 +10,7 @@ from core.briefing import (
     PortfolioHealth,
     WatchlistItem,
     assemble_briefing,
+    render_briefing_text,
     sort_actions_by_conviction,
     sort_book_by_attention,
 )
@@ -127,3 +128,46 @@ class TestAssembleBriefing:
     def test_no_import_ever_drift_surfaced(self):
         briefing = assemble_briefing(**self.base_kwargs(drift=None))
         assert briefing.drift_warning is None
+
+
+class TestRenderBriefingText:
+    def test_renders_all_sections(self):
+        from core.risk_rules import KillSwitchStatus
+
+        briefing = assemble_briefing(
+            generated_at=NOW,
+            actions_today=[ActionItem(order=order("ANET", 74), headline="New position", thesis_summary="strong margins")],
+            watching=[WatchlistItem(ticker="CRDO", reason="near stop", distance_to_trigger_pct=3.1)],
+            overnight_changes=[OvernightChange(ticker="AMD", summary="guidance raised")],
+            book=[book_entry("NBIS", weight_pct=1.8, has_exit_trigger=True)],
+            portfolio_health=PortfolioHealth(cash_pct=98.2, drawdown_from_peak_pct=0.0, kill_switch=KillSwitchStatus(triggered=False)),
+            drift=None,
+        )
+        text = render_briefing_text(briefing)
+        assert "ANET" in text
+        assert "strong margins" in text
+        assert "CRDO" in text
+        assert "AMD" in text
+        assert "guidance raised" in text
+        assert "NBIS" in text
+        assert "EXIT TRIGGERED" in text
+        assert "Kill switch: OK" in text
+        assert "Cash: 98.2%" in text
+
+    def test_empty_sections_render_placeholder(self):
+        briefing = assemble_briefing(
+            generated_at=NOW, actions_today=[], watching=[], overnight_changes=[], book=[],
+            portfolio_health=PortfolioHealth(), drift=None,
+        )
+        text = render_briefing_text(briefing)
+        assert "(none)" in text
+        assert "(no open positions)" in text
+
+    def test_drift_warning_rendered_when_present(self):
+        stale = DriftStatus(stale=True, last_import_at=None, days_since_import=None, threshold_days=7)
+        briefing = assemble_briefing(
+            generated_at=NOW, actions_today=[], watching=[], overnight_changes=[], book=[],
+            portfolio_health=PortfolioHealth(), drift=stale,
+        )
+        text = render_briefing_text(briefing)
+        assert "DRIFT WARNING" in text

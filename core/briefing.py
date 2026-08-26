@@ -122,3 +122,83 @@ def assemble_briefing(
         portfolio_health=portfolio_health,
         drift_warning=drift if (drift is not None and drift.stale) else None,
     )
+
+
+def render_briefing_text(briefing: Briefing) -> str:
+    """Plain-text rendering of §3's five sections — a debug/CLI view for
+    looking at pipeline output before there's a UI (step 10) to show it in.
+    Not meant to be the UI itself."""
+    lines: list[str] = []
+    lines.append(f"=== ZOPRO BRIEFING — {briefing.generated_at:%Y-%m-%d %H:%M} ===")
+    lines.append("")
+
+    if briefing.drift_warning is not None:
+        d = briefing.drift_warning
+        if d.last_import_at is None:
+            lines.append("⚠ DRIFT WARNING: positions have never been imported from a broker CSV.")
+        else:
+            lines.append(
+                f"⚠ DRIFT WARNING: last import was {d.days_since_import:.1f} days ago "
+                f"(threshold {d.threshold_days} days). Positions may be stale."
+            )
+        lines.append("")
+
+    lines.append("--- Actions today ---")
+    if not briefing.actions_today:
+        lines.append("(none)")
+    for item in briefing.actions_today:
+        o = item.order
+        trim_note = " (trim)" if o.is_trim else ""
+        lines.append(
+            f"{o.action:<5} {o.ticker:<6} {o.quantity} shares   {o.order_type} ${o.limit_price:.2f}   "
+            f"~${o.estimated_cost_usd:,.0f}   ({o.weight_pct:.1f}% of NAV){trim_note}"
+        )
+        lines.append(f"      Conviction {o.conviction:.0f} · {item.headline}")
+        if item.thesis_summary:
+            lines.append(f"      Why: {item.thesis_summary}")
+        if item.bear_case:
+            lines.append(f"      Bear case: {item.bear_case}")
+        lines.append("")
+
+    lines.append("--- Watching ---")
+    if not briefing.watching:
+        lines.append("(none)")
+    for w in briefing.watching:
+        dist = f"{w.distance_to_trigger_pct:.1f}" if w.distance_to_trigger_pct is not None else "?"
+        lines.append(f"{w.ticker:<6} {w.reason} (distance {dist})")
+    lines.append("")
+
+    lines.append("--- Overnight changes ---")
+    if not briefing.overnight_changes:
+        lines.append("(none)")
+    for c in briefing.overnight_changes:
+        lines.append(f"{c.ticker:<6} {c.summary}")
+    lines.append("")
+
+    lines.append("--- Your book ---")
+    if not briefing.book:
+        lines.append("(no open positions)")
+    for b in briefing.book:
+        conv = (
+            f"conviction {b.conviction_now:.0f} (was {b.conviction_at_entry:.0f})"
+            if b.conviction_now is not None and b.conviction_at_entry is not None
+            else "conviction n/a"
+        )
+        flag = "  ⚠ EXIT TRIGGERED" if b.has_exit_trigger else ""
+        lines.append(
+            f"{b.ticker:<6} qty={b.qty:g}  value=${b.value_usd:,.0f}  weight={b.weight_pct:.1f}%  "
+            f"pnl={b.unrealized_pnl_pct:+.1f}%  {conv}{flag}"
+        )
+    lines.append("")
+
+    lines.append("--- Portfolio health ---")
+    ph = briefing.portfolio_health
+    lines.append(f"Cash: {ph.cash_pct:.1f}%   Drawdown from peak: {ph.drawdown_from_peak_pct:.1f}%")
+    if ph.kill_switch is not None:
+        status = "TRIGGERED — " + "; ".join(ph.kill_switch.reasons) if ph.kill_switch.triggered else "OK"
+        lines.append(f"Kill switch: {status}")
+    if ph.correlated_cluster_pct:
+        clusters = ", ".join(f"{name} {pct:.1f}%" for name, pct in sorted(ph.correlated_cluster_pct.items()))
+        lines.append(f"Correlated clusters: {clusters}")
+
+    return "\n".join(lines)

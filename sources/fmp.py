@@ -5,15 +5,33 @@ insider. Cache hard; free tier is 250 calls/day."
 Prep endpoints Zopro needs. `FMPFactorSource` adapts it to the §8.2
 `FactorSource` interface so it plugs into the pipeline like any other source.
 
-Two things worth knowing if you're extending this:
+**API generation: `/stable/`, not `/api/v3/`.** FMP retired the old
+path-segment API (`/api/v3/profile/AAPL`) in favor of a flat `/stable/`
+generation where the resource is a plain path component and the symbol is a
+query parameter (`/stable/profile?symbol=AAPL`) — confirmed by hitting the
+real API during development (`/v3/sp500_constituent` now 403s with "Legacy
+Endpoint... only available for legacy users with valid subscriptions prior
+August 31, 2025"). This module targets `/stable/` throughout. Endpoint
+resource names below fall into two confidence tiers:
 
+* **Confirmed** (profile, quote, income-statement, cash-flow-statement,
+  historical-price-eod/full, analyst-estimates, sp500-constituent) — checked
+  against FMP's current docs/an actively-maintained third-party client
+  during development.
+* **Best-effort, not independently confirmed** (earnings-surprises,
+  price-target-summary, institutional-ownership, insider-trading) — FMP's
+  13F/insider/estimates surface has been renamed and restructured
+  repeatedly (e.g. 13F now also exists as a CIK+year+quarter "extract" API,
+  a separate "positions-summary" API, and a legacy per-symbol API), and
+  the exact current resource path for a couple of these wasn't confirmed
+  before writing this. If one 404s/403s on your account, that's this
+  module's guess being wrong, not a plan-tier issue — check FMP's docs for
+  the resource's current name and update the constant below. Every one of
+  these calls already degrades gracefully (`FactorData.error` /
+  `FmpMarketDataGateway`'s try/except) rather than crashing a run either way.
 * The HTTP layer is injected (`session`), not imported directly, so tests
   never make real network calls or spend real API quota — see
   tests/test_fmp_client.py for the fake-session pattern.
-* 13F institutional ownership and insider trading are FMP endpoints that have
-  moved between plan tiers before. If either 402/403s on your account, that's
-  a plan-tier issue, not a bug here — the error surfaces through
-  `FactorData.error` rather than crashing a run.
 * Caching is deliberately per-endpoint-per-ticker with a TTL matched to how
   often that data actually changes (fundamentals: monthly; quotes/prices:
   daily; ownership: monthly). This is what makes "250 calls/day" survive a
@@ -33,7 +51,7 @@ from typing import Any, Protocol
 from core.cache import DailyCallBudget, FileCache
 from sources.base import FactorData, FactorSource, RunContext
 
-BASE_URL = "https://financialmodelingprep.com/api"
+BASE_URL = "https://financialmodelingprep.com/stable"
 
 # TTLs, in seconds — how long a cached response is trusted before refetching.
 TTL_PROFILE = 7 * 24 * 3600
@@ -44,6 +62,12 @@ TTL_EARNINGS = 7 * 24 * 3600
 TTL_ANALYST = 3 * 24 * 3600
 TTL_OWNERSHIP_13F = 30 * 24 * 3600
 TTL_INSIDER = 3 * 24 * 3600
+
+# Best-effort resource names — see module docstring's confidence tiers.
+RESOURCE_EARNINGS_SURPRISES = "earnings-surprises"
+RESOURCE_PRICE_TARGET_SUMMARY = "price-target-summary"
+RESOURCE_INSTITUTIONAL_OWNERSHIP = "institutional-ownership/symbol-positions-summary"
+RESOURCE_INSIDER_TRADING = "insider-trading"
 
 
 class FMPError(RuntimeError):
@@ -72,22 +96,25 @@ class FMPClient:
 
     # ------------------------------------------------------------- transport
 
-    def _get(self, path: str, params: dict | None = None, ttl_seconds: float = TTL_QUOTE) -> Any:
+    def _get(self, resource: str, params: dict | None = None, ttl_seconds: float = TTL_QUOTE) -> Any:
+        """`resource` is a stable-API resource path, e.g. "profile" or
+        "institutional-ownership/symbol-positions-summary" — no leading
+        slash, no symbol segment (pass `symbol` in `params` instead)."""
         params = dict(params or {})
-        cache_key = "fmp:" + path + ":" + json.dumps(params, sort_keys=True)
+        cache_key = "fmp:" + resource + ":" + json.dumps(params, sort_keys=True)
 
         def do_fetch() -> Any:
             self.budget.check_and_increment()
             response = self.session.get(
-                self.base_url + path,
+                f"{self.base_url}/{resource}",
                 params={**params, "apikey": self.api_key},
                 timeout=10,
             )
             if response.status_code != 200:
-                raise FMPError(f"FMP {path} returned HTTP {response.status_code}: {response.text[:200]}")
+                raise FMPError(f"FMP {resource} returned HTTP {response.status_code}: {response.text[:200]}")
             data = response.json()
             if isinstance(data, dict) and "Error Message" in data:
-                raise FMPError(f"FMP {path} error: {data['Error Message']}")
+                raise FMPError(f"FMP {resource} error: {data['Error Message']}")
             return data
 
         value, _ = self.cache.get_or_fetch(cache_key, ttl_seconds, do_fetch)
@@ -96,24 +123,24 @@ class FMPClient:
     # --------------------------------------------------------- fundamentals
 
     def get_profile(self, ticker: str) -> dict:
-        data = self._get(f"/v3/profile/{ticker}", ttl_seconds=TTL_PROFILE)
+        data = self._get("profile", params={"symbol": ticker}, ttl_seconds=TTL_PROFILE)
         return data[0] if isinstance(data, list) and data else (data or {})
 
     def get_quote(self, ticker: str) -> dict:
-        data = self._get(f"/v3/quote/{ticker}", ttl_seconds=TTL_QUOTE)
+        data = self._get("quote", params={"symbol": ticker}, ttl_seconds=TTL_QUOTE)
         return data[0] if isinstance(data, list) and data else (data or {})
 
     def get_income_statement(self, ticker: str, period: str = "annual", limit: int = 5) -> list[dict]:
         return self._get(
-            f"/v3/income-statement/{ticker}",
-            params={"period": period, "limit": limit},
+            "income-statement",
+            params={"symbol": ticker, "period": period, "limit": limit},
             ttl_seconds=TTL_FUNDAMENTALS,
         ) or []
 
     def get_cash_flow_statement(self, ticker: str, period: str = "annual", limit: int = 5) -> list[dict]:
         return self._get(
-            f"/v3/cash-flow-statement/{ticker}",
-            params={"period": period, "limit": limit},
+            "cash-flow-statement",
+            params={"symbol": ticker, "period": period, "limit": limit},
             ttl_seconds=TTL_FUNDAMENTALS,
         ) or []
 
@@ -122,21 +149,22 @@ class FMPClient:
     def get_historical_prices(
         self, ticker: str, from_date: str | None = None, to_date: str | None = None
     ) -> list[dict]:
-        params = {}
+        params = {"symbol": ticker}
         if from_date:
             params["from"] = from_date
         if to_date:
             params["to"] = to_date
-        data = self._get(
-            f"/v3/historical-price-full/{ticker}", params=params, ttl_seconds=TTL_HISTORICAL_PRICES
-        )
-        return (data or {}).get("historical", [])
+        data = self._get("historical-price-eod/full", params=params, ttl_seconds=TTL_HISTORICAL_PRICES)
+        # stable API returns a bare list, not {"historical": [...]} like the old v3 shape
+        if isinstance(data, dict):
+            return data.get("historical", [])
+        return data or []
 
     # -------------------------------------------------------------- earnings
 
     def get_earnings_surprises(self, ticker: str, limit: int = 8) -> list[dict]:
         data = self._get(
-            f"/v3/earnings-surprises/{ticker}", params={"limit": limit}, ttl_seconds=TTL_EARNINGS
+            RESOURCE_EARNINGS_SURPRISES, params={"symbol": ticker, "limit": limit}, ttl_seconds=TTL_EARNINGS
         )
         return data or []
 
@@ -144,13 +172,13 @@ class FMPClient:
 
     def get_analyst_estimates(self, ticker: str, period: str = "annual", limit: int = 4) -> list[dict]:
         return self._get(
-            f"/v3/analyst-estimates/{ticker}",
-            params={"period": period, "limit": limit},
+            "analyst-estimates",
+            params={"symbol": ticker, "period": period, "limit": limit},
             ttl_seconds=TTL_ANALYST,
         ) or []
 
     def get_price_target_summary(self, ticker: str) -> dict:
-        data = self._get("/v4/price-target-summary", params={"symbol": ticker}, ttl_seconds=TTL_ANALYST)
+        data = self._get(RESOURCE_PRICE_TARGET_SUMMARY, params={"symbol": ticker}, ttl_seconds=TTL_ANALYST)
         if isinstance(data, list):
             return data[0] if data else {}
         return data or {}
@@ -159,17 +187,17 @@ class FMPClient:
 
     def get_institutional_ownership(self, ticker: str) -> list[dict]:
         data = self._get(
-            "/v4/institutional-ownership/symbol-ownership",
-            params={"symbol": ticker, "includeCurrentQuarter": "false"},
+            RESOURCE_INSTITUTIONAL_OWNERSHIP,
+            params={"symbol": ticker},
             ttl_seconds=TTL_OWNERSHIP_13F,
         )
-        return data or []
+        return data if isinstance(data, list) else ([data] if data else [])
 
     # --------------------------------------------------------------- insider
 
     def get_insider_trading(self, ticker: str, limit: int = 50) -> list[dict]:
         data = self._get(
-            "/v4/insider-trading", params={"symbol": ticker, "limit": limit}, ttl_seconds=TTL_INSIDER
+            RESOURCE_INSIDER_TRADING, params={"symbol": ticker, "limit": limit}, ttl_seconds=TTL_INSIDER
         )
         return data or []
 
@@ -179,7 +207,7 @@ class FMPClient:
         """One call regardless of universe size — the rotating-pool source
         for the day-to-day universe (see core/orchestrator.py's
         resolve_universe). Membership changes rarely, hence the long TTL."""
-        data = self._get("/v3/sp500_constituent", ttl_seconds=TTL_OWNERSHIP_13F)  # reuse the ~30-day TTL
+        data = self._get("sp500-constituent", ttl_seconds=TTL_OWNERSHIP_13F)  # reuse the ~30-day TTL
         return sorted({row["symbol"].upper() for row in (data or []) if row.get("symbol")})
 
 

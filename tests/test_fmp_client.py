@@ -1,5 +1,12 @@
 """FMPClient tests — HTTP is a fake session, never a real request. No test in
-this file may hit the network or spend real FMP quota."""
+this file may hit the network or spend real FMP quota.
+
+The stable API keys most calls by a `symbol` query param rather than a
+distinct URL path per ticker, so FakeSession's responses are keyed by
+resource path (e.g. "profile") when a test doesn't care which ticker was
+asked for, or "resource#SYMBOL" (e.g. "quote#AMD") when a test needs
+different responses for different tickers hitting the same resource.
+"""
 
 import datetime as dt
 
@@ -21,18 +28,29 @@ class FakeResponse:
 
 
 class FakeSession:
-    """Records every call and serves canned responses keyed by path."""
-
     def __init__(self, responses: dict[str, FakeResponse]):
         self.responses = responses
         self.calls: list[tuple[str, dict]] = []
 
     def get(self, url, params, timeout):
         self.calls.append((url, params))
-        for path, response in self.responses.items():
-            if url.endswith(path):
+        symbol = params.get("symbol")
+
+        if symbol:
+            for key, response in self.responses.items():
+                if "#" not in key:
+                    continue
+                path_part, _, sym_part = key.rpartition("#")
+                if url.endswith(path_part) and sym_part == symbol:
+                    return response
+
+        for key, response in self.responses.items():
+            if "#" in key:
+                continue
+            if url.endswith(key):
                 return response
-        raise AssertionError(f"no fake response registered for {url}")
+
+        raise AssertionError(f"no fake response registered for {url} params={params}")
 
 
 def make_client(tmp_path, responses, daily_limit=250):
@@ -46,34 +64,42 @@ def make_client(tmp_path, responses, daily_limit=250):
 class TestFMPClientBasics:
     def test_get_profile_unwraps_list(self, tmp_path):
         client, session = make_client(
-            tmp_path, {"/v3/profile/AMD": FakeResponse(payload=[{"symbol": "AMD", "mktCap": 1000}])}
+            tmp_path, {"profile": FakeResponse(payload=[{"symbol": "AMD", "mktCap": 1000}])}
         )
         profile = client.get_profile("AMD")
         assert profile == {"symbol": "AMD", "mktCap": 1000}
 
     def test_apikey_sent_as_query_param(self, tmp_path):
         client, session = make_client(
-            tmp_path, {"/v3/quote/AMD": FakeResponse(payload=[{"symbol": "AMD", "price": 150}])}
+            tmp_path, {"quote": FakeResponse(payload=[{"symbol": "AMD", "price": 150}])}
         )
         client.get_quote("AMD")
         assert session.calls[0][1]["apikey"] == "test-key"
 
+    def test_symbol_sent_as_query_param(self, tmp_path):
+        client, session = make_client(
+            tmp_path, {"quote": FakeResponse(payload=[{"symbol": "AMD", "price": 150}])}
+        )
+        client.get_quote("AMD")
+        assert session.calls[0][1]["symbol"] == "AMD"
+        assert session.calls[0][0].endswith("/stable/quote")  # ticker not in the URL path
+
     def test_second_call_is_served_from_cache(self, tmp_path):
         client, session = make_client(
-            tmp_path, {"/v3/quote/AMD": FakeResponse(payload=[{"symbol": "AMD", "price": 150}])}
+            tmp_path, {"quote": FakeResponse(payload=[{"symbol": "AMD", "price": 150}])}
         )
         client.get_quote("AMD")
         client.get_quote("AMD")
         assert len(session.calls) == 1  # second call hit the cache, no network
 
     def test_non_200_raises_fmp_error(self, tmp_path):
-        client, session = make_client(tmp_path, {"/v3/quote/BAD": FakeResponse(status_code=404, text="not found")})
+        client, session = make_client(tmp_path, {"quote": FakeResponse(status_code=404, text="not found")})
         with pytest.raises(FMPError):
             client.get_quote("BAD")
 
     def test_error_message_payload_raises_fmp_error(self, tmp_path):
         client, session = make_client(
-            tmp_path, {"/v3/quote/BAD": FakeResponse(payload={"Error Message": "Invalid API key"})}
+            tmp_path, {"quote": FakeResponse(payload={"Error Message": "Invalid API key"})}
         )
         with pytest.raises(FMPError, match="Invalid API key"):
             client.get_quote("BAD")
@@ -81,7 +107,7 @@ class TestFMPClientBasics:
     def test_failed_call_does_not_consume_budget_twice(self, tmp_path):
         # a raised FMPError still counts as one call against the budget —
         # it happened, it just wasn't useful
-        client, session = make_client(tmp_path, {"/v3/quote/BAD": FakeResponse(status_code=500)}, daily_limit=1)
+        client, session = make_client(tmp_path, {"quote": FakeResponse(status_code=500)}, daily_limit=1)
         with pytest.raises(FMPError):
             client.get_quote("BAD")
         assert client.budget.used_today() == 1
@@ -90,8 +116,8 @@ class TestFMPClientBasics:
         client, session = make_client(
             tmp_path,
             {
-                "/v3/quote/AMD": FakeResponse(payload=[{"symbol": "AMD"}]),
-                "/v3/quote/NVDA": FakeResponse(payload=[{"symbol": "NVDA"}]),
+                "quote#AMD": FakeResponse(payload=[{"symbol": "AMD"}]),
+                "quote#NVDA": FakeResponse(payload=[{"symbol": "NVDA"}]),
             },
             daily_limit=1,
         )
@@ -99,21 +125,26 @@ class TestFMPClientBasics:
         with pytest.raises(BudgetExceeded):
             client.get_quote("NVDA")
 
-    def test_historical_prices_unwraps_historical_key(self, tmp_path):
+    def test_historical_prices_returns_bare_list(self, tmp_path):
         client, session = make_client(
             tmp_path,
-            {
-                "/v3/historical-price-full/AMD": FakeResponse(
-                    payload={"symbol": "AMD", "historical": [{"date": "2026-08-24", "close": 168.5}]}
-                )
-            },
+            {"historical-price-eod/full": FakeResponse(payload=[{"date": "2026-08-24", "close": 168.5}])},
         )
         rows = client.get_historical_prices("AMD")
         assert rows == [{"date": "2026-08-24", "close": 168.5}]
 
-    def test_v4_endpoint_uses_query_param_symbol(self, tmp_path):
+    def test_historical_prices_unwraps_legacy_dict_shape_too(self, tmp_path):
+        # defensive: tolerate the old v3 {"historical": [...]} shape if it ever appears
         client, session = make_client(
-            tmp_path, {"/v4/insider-trading": FakeResponse(payload=[{"symbol": "AMD", "transactionType": "S-Sale"}])}
+            tmp_path,
+            {"historical-price-eod/full": FakeResponse(payload={"historical": [{"date": "2026-08-24", "close": 168.5}]})},
+        )
+        rows = client.get_historical_prices("AMD")
+        assert rows == [{"date": "2026-08-24", "close": 168.5}]
+
+    def test_insider_trading_uses_symbol_query_param(self, tmp_path):
+        client, session = make_client(
+            tmp_path, {"insider-trading": FakeResponse(payload=[{"symbol": "AMD", "transactionType": "S-Sale"}])}
         )
         rows = client.get_insider_trading("AMD")
         assert rows[0]["symbol"] == "AMD"
@@ -122,18 +153,14 @@ class TestFMPClientBasics:
     def test_sp500_constituents_returns_sorted_unique_symbols(self, tmp_path):
         client, session = make_client(
             tmp_path,
-            {
-                "/v3/sp500_constituent": FakeResponse(
-                    payload=[{"symbol": "nvda"}, {"symbol": "AMD"}, {"symbol": "AMD"}]
-                )
-            },
+            {"sp500-constituent": FakeResponse(payload=[{"symbol": "nvda"}, {"symbol": "AMD"}, {"symbol": "AMD"}])},
         )
         constituents = client.get_sp500_constituents()
         assert constituents == ["AMD", "NVDA"]
 
     def test_sp500_constituents_is_one_call_regardless_of_pool_size(self, tmp_path):
         client, session = make_client(
-            tmp_path, {"/v3/sp500_constituent": FakeResponse(payload=[{"symbol": f"T{i}"} for i in range(500)])}
+            tmp_path, {"sp500-constituent": FakeResponse(payload=[{"symbol": f"T{i}"} for i in range(500)])}
         )
         client.get_sp500_constituents()
         client.get_sp500_constituents()
@@ -143,15 +170,15 @@ class TestFMPClientBasics:
 class TestFMPFactorSource:
     def _responses(self):
         return {
-            "/v3/profile/AMD": FakeResponse(payload=[{"symbol": "AMD"}]),
-            "/v3/quote/AMD": FakeResponse(payload=[{"symbol": "AMD", "price": 168.5}]),
-            "/v3/income-statement/AMD": FakeResponse(payload=[{"revenue": 1000}]),
-            "/v3/cash-flow-statement/AMD": FakeResponse(payload=[{"freeCashFlow": 200}]),
-            "/v3/earnings-surprises/AMD": FakeResponse(payload=[]),
-            "/v3/analyst-estimates/AMD": FakeResponse(payload=[]),
-            "/v4/price-target-summary": FakeResponse(payload=[]),
-            "/v4/institutional-ownership/symbol-ownership": FakeResponse(payload=[]),
-            "/v4/insider-trading": FakeResponse(payload=[]),
+            "profile": FakeResponse(payload=[{"symbol": "AMD"}]),
+            "quote": FakeResponse(payload=[{"symbol": "AMD", "price": 168.5}]),
+            "income-statement": FakeResponse(payload=[{"revenue": 1000}]),
+            "cash-flow-statement": FakeResponse(payload=[{"freeCashFlow": 200}]),
+            "earnings-surprises": FakeResponse(payload=[]),
+            "analyst-estimates": FakeResponse(payload=[]),
+            "price-target-summary": FakeResponse(payload=[]),
+            "institutional-ownership/symbol-positions-summary": FakeResponse(payload=[]),
+            "insider-trading": FakeResponse(payload=[]),
         }
 
     def test_fetch_assembles_all_fields(self, tmp_path):
@@ -169,7 +196,7 @@ class TestFMPFactorSource:
 
     def test_fetch_returns_errored_factordata_on_failure(self, tmp_path):
         responses = self._responses()
-        responses["/v3/profile/AMD"] = FakeResponse(status_code=500, text="boom")
+        responses["profile"] = FakeResponse(status_code=500, text="boom")
         client, session = make_client(tmp_path, responses)
         source = FMPFactorSource(client)
         ctx = RunContext(run_id=1, as_of=dt.datetime(2026, 8, 25))

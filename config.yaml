@@ -34,6 +34,13 @@ research:
   model: claude-sonnet-4-6
   max_candidates_per_run: 15
 
+order_builder:
+  # §5.4 names the job ("limit price from recent price action and spread")
+  # but not a formula; not itself a numbered §10 step. Defaults below are
+  # not spec'd — see core/config.py's OrderBuilderConfig docstring.
+  limit_buffer_pct: 0.5
+  profit_trim_fraction: 0.5
+
 sleeves:                         # % of NAV
   core_longterm: 35              # VTI, VGT, IAU — held, not actively traded
   thematic: 45

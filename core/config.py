@@ -76,6 +76,16 @@ class ResearchConfig(BaseModel):
     max_candidates_per_run: int = 15
 
 
+class OrderBuilderConfig(BaseModel):
+    """§5.4 names Order Builder's job ("limit price from recent price action
+    and spread") but not a formula, and isn't itself a numbered §10 step —
+    it's built alongside step 8 because the briefing (§3) can't render an
+    order line without one. Defaults chosen here, not spec'd."""
+
+    limit_buffer_pct: float = 0.5  # BUY: current_price * (1 + this); SELL: * (1 - this)
+    profit_trim_fraction: float = 0.5  # fraction of the position sold when PROFIT_BAND triggers
+
+
 class BudgetConfig(BaseModel):
     monthly_api_cap_usd: float = 40
 
@@ -92,6 +102,7 @@ class Config(BaseModel):
     conviction_scaling: ConvictionScalingConfig = ConvictionScalingConfig()
     conviction_weights: dict[str, float] = {}
     research: ResearchConfig = ResearchConfig()
+    order_builder: OrderBuilderConfig = OrderBuilderConfig()
     budget: BudgetConfig = BudgetConfig()
 
 

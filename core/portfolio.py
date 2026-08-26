@@ -27,6 +27,19 @@ Design notes that aren't obvious from the spec text alone:
   about this position"), but it must NOT clear the drift warning: it's a
   self-reported fill, not a broker-confirmed one, which is exactly the kind
   of entry error CSV reconciliation exists to catch.
+
+* **The base-currency trap.** IBKR's account dashboard — NAV, cash balance,
+  "excess liquidity" — displays figures in the account's BASE CURRENCY by
+  default (e.g. SGD), even when every position traded is USD. This bit a
+  real user during development: they read "$53.21 excess liquidity" and
+  "$15,523 market value" off the dashboard, both of which were actually the
+  SGD-denominated figures, not USD. `parse_flex_cash_balance` already
+  guards against this for CSV imports — it filters to `CurrencyPrimary ==
+  "USD"` rows before summing — but there is no equivalent guard for a
+  number a human transcribes by hand into `--cash` or a manual entry.
+  Always ask "which currency is this figure actually in" before trusting a
+  dashboard number, and see core/money.py for why NAV/cash are `Money`
+  (currency-tagged), not bare floats, specifically at this boundary.
 """
 
 from __future__ import annotations
@@ -43,6 +56,7 @@ from sqlalchemy.orm import Session
 
 from core.config import PortfolioConfig
 from core.models import Position, PositionImport
+from core.money import Money, usd
 
 # Reconciliation tolerances: Flex Query numbers are broker-rounded, so exact
 # equality is too strict. Quantities should match exactly for equities
@@ -190,16 +204,17 @@ def parse_flex_csv(source: str | IO[str]) -> list[ImportedPosition]:
     return out
 
 
-def parse_flex_cash_balance(source: str | IO[str]) -> float | None:
+def parse_flex_cash_balance(source: str | IO[str]) -> Money | None:
     """Sums CASH-classified rows' Position value from an IBKR Flex Query
     export — added for core/nav.py's NAV calculation, on top of §2's
     original CSV parsing which only cared about equities.
 
     USD-only: a CurrencyPrimary column, if present, filters to USD rows
-    only. A multi-currency account needs this extended — a documented gap,
-    not a silent one. Returns None (not 0.0) when the balance can't be
-    determined at all — the caller must not confuse "no cash data in this
-    export" with "zero cash"."""
+    only — this is what protects an import from the base-currency trap
+    (module docstring) that bit a manually-entered figure. A multi-currency
+    account needs this extended — a documented gap, not a silent one.
+    Returns None (not $0) when the balance can't be determined at all — the
+    caller must not confuse "no cash data in this export" with "zero cash"."""
     text = source.read() if hasattr(source, "read") else source
     reader = csv.DictReader(io.StringIO(text))
     if not reader.fieldnames:
@@ -228,7 +243,7 @@ def parse_flex_cash_balance(source: str | IO[str]) -> float | None:
         except (TypeError, ValueError):
             continue
 
-    return total if found else None
+    return usd(total) if found else None
 
 
 def _costs_match(a: float, b: float) -> bool:
@@ -384,24 +399,26 @@ class PortfolioService:
     def import_flex_csv(self, source: str | IO[str], filename: str) -> ReconciliationResult:
         text = source.read() if hasattr(source, "read") else source
         rows = parse_flex_csv(text)
-        cash_usd = parse_flex_cash_balance(text)
+        cash = parse_flex_cash_balance(text)  # already USD-filtered — see module docstring's currency trap note
         result = self.reconcile(rows, filename=filename)
         record = PositionImport(
             imported_at=result.imported_at,
             filename=filename,
             rows=result.rows,
             reconciliation_json=result.as_json(),
-            cash_usd=cash_usd,
+            cash_usd=cash.amount if cash is not None else None,
         )
         self.session.add(record)
         self.session.flush()
         return result
 
-    def latest_cash_balance(self) -> float | None:
+    def latest_cash_balance(self) -> Money | None:
         """None if there's never been an import, or the import's CSV had no
         parseable cash row — distinct from an actual zero balance."""
         last = self.last_import()
-        return last.cash_usd if last is not None else None
+        if last is None or last.cash_usd is None:
+            return None
+        return usd(last.cash_usd)
 
     def reconcile(
         self,

@@ -46,7 +46,11 @@ class PositionImport(Base):
     # Added alongside core/nav.py: the account's cash balance as of this
     # import, read from the Flex Query CSV's CASH rows. Nullable because
     # older imports (before this column existed) and manual-only books
-    # won't have one.
+    # won't have one. Always USD — parse_flex_cash_balance filters to
+    # CurrencyPrimary=="USD" before summing (see core/portfolio.py's
+    # "base-currency trap" note and core/money.py), so no separate currency
+    # column is needed here; the app-level type is core.money.Money, this
+    # column is its .amount.
     cash_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
@@ -160,7 +164,14 @@ class NavSnapshot(Base):
     up from run to run — start it at zero on first run." One row per run;
     `peak_nav_usd` and `drawdown_pct` are derived by comparing against the
     single prior row, same never-recompute-from-scratch pattern as
-    positions.peak_price_since_activation (§6)."""
+    positions.peak_price_since_activation (§6).
+
+    NAV/cash figures are USD by construction (core/nav.py's compute_nav only
+    accepts core.money.Money — see that module's docstring for the real bug
+    this guards against: a broker dashboard showing figures in the account's
+    base currency, not the trading currency). These *_usd columns are each
+    Money's .amount; the app-level values are always tagged Money, this is
+    just their storage representation."""
 
     __tablename__ = "nav_snapshots"
 

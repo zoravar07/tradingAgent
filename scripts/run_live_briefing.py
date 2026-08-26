@@ -16,6 +16,11 @@ Usage:
     # add positions by hand first, then run (repeatable):
     .venv/bin/python scripts/run_live_briefing.py --manual AMD,10,142.30 --manual NBIS,8,218.00
 
+    # override cash directly (e.g. no Flex CSV imported this session yet) —
+    # BE SURE this is your USD cash balance, not your account's base currency
+    # if it differs (see core/money.py's docstring for why that matters):
+    .venv/bin/python scripts/run_live_briefing.py --cash 41.91
+
     # see the resolved universe without spending anything:
     .venv/bin/python scripts/run_live_briefing.py --dry-run-universe
 
@@ -44,6 +49,7 @@ from core.cache import DailyCallBudget, FileCache  # noqa: E402
 from core.config import load_config  # noqa: E402
 from core.db import init_db, make_engine, make_session_factory  # noqa: E402
 from core.llm import LLMClient, MonthlySpendTracker  # noqa: E402
+from core.money import usd  # noqa: E402
 from core.orchestrator import NightlyRunInputs, resolve_universe, run_nightly  # noqa: E402
 from core.portfolio import PortfolioService  # noqa: E402
 from sources.fmp import FMPClient  # noqa: E402
@@ -54,6 +60,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--import-csv", type=str, default=None, help="Flex Query CSV path to import before running")
     parser.add_argument("--manual", action="append", default=[], help="TICKER,QTY,AVG_COST — repeatable")
+    parser.add_argument(
+        "--cash", type=float, default=None,
+        help="USD cash balance override — use this if no Flex CSV has been imported. "
+        "Must be USD, not the account's base currency if different (see core/money.py).",
+    )
     parser.add_argument("--dry-run-universe", action="store_true", help="Print the resolved universe and exit; no API calls")
     return parser.parse_args()
 
@@ -113,8 +124,12 @@ def main() -> None:
     llm_budget = MonthlySpendTracker(ROOT / "data" / "llm_spend.json", config.budget.monthly_api_cap_usd)
     llm = LLMClient(anthropic_client, llm_budget)
 
-    cash_usd = portfolio.latest_cash_balance() or 0.0
-    inputs = NightlyRunInputs(as_of=as_of, universe_tickers=universe, held_tickers=held_tickers, cash_usd=cash_usd)
+    if args.cash is not None:
+        cash = usd(args.cash)
+        print(f"Using --cash override: {cash} (not read from any import)")
+    else:
+        cash = portfolio.latest_cash_balance() or usd(0.0)
+    inputs = NightlyRunInputs(as_of=as_of, universe_tickers=universe, held_tickers=held_tickers, cash=cash)
 
     spent_before = llm_budget.spent_this_month()
     fmp_used_before = fmp_budget.used_today()

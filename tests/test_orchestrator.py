@@ -23,6 +23,7 @@ from core.config import (
 )
 from core.llm import LLMClient, MonthlySpendTracker
 from core.models import Candidate, Conviction, NavSnapshot, Proposal, ResearchOutput, Run
+from core.money import usd
 from core.config import UniverseConfig, WeeklyWideScanConfig
 from core.orchestrator import NightlyRunInputs, build_universe, resolve_universe, rotating_slice, run_nightly
 from sources.prices import TechnicalSnapshot
@@ -218,7 +219,7 @@ class TestFullNightlyRun:
             as_of=dt.datetime(2026, 8, 25, 22, 0, 0),
             universe_tickers=build_universe(held_tickers=["NBIS"], watchlist=[], scan_tickers=["AMD", "NVDA", "BADCO"]),
             held_tickers=["NBIS"],
-            cash_usd=98_224.0,
+            cash=usd(98_224.0),
         )
 
         briefing = run_nightly(session=session, config=config, gateway=gateway, llm=llm, portfolio=portfolio, inputs=run_inputs)
@@ -310,7 +311,7 @@ class TestFullNightlyRun:
             as_of=dt.datetime(2026, 8, 25, 22, 0, 0),
             universe_tickers=build_universe(held_tickers=["NBIS"], watchlist=[], scan_tickers=["AMD"]),
             held_tickers=["NBIS"],
-            cash_usd=8_224.0,
+            cash=usd(8_224.0),
         )
 
         briefing = run_nightly(session=session, config=config, gateway=gateway, llm=llm, portfolio=portfolio, inputs=run_inputs)
@@ -343,7 +344,7 @@ class TestFullNightlyRun:
             as_of=dt.datetime(2026, 8, 25, 22, 0, 0),
             universe_tickers=build_universe(held_tickers=[], watchlist=[], scan_tickers=["AMD", "NVDA"]),
             held_tickers=[],
-            cash_usd=100_000.0,
+            cash=usd(100_000.0),
         )
 
         briefing = run_nightly(session=session, config=config, gateway=gateway, llm=llm, portfolio=portfolio, inputs=run_inputs)

@@ -29,7 +29,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 from sqlalchemy import select
@@ -57,6 +57,7 @@ from core.config import Config, UniverseConfig
 from core.llm import LLMClient
 from core.models import Candidate, Conviction as ConvictionRow, Proposal, ResearchOutput, RiskEvent, Run
 from core.models import WatchlistItem as WatchlistItemRow
+from core.money import Money, usd
 from core.nav import compute_nav, record_nav
 from core.portfolio import PortfolioService
 from core.risk_rules import (
@@ -126,7 +127,10 @@ class NightlyRunInputs:
     as_of: dt.datetime
     universe_tickers: list[str]
     held_tickers: list[str]
-    cash_usd: float = 0.0
+    # Money, not a bare float — see core/money.py's docstring for the real
+    # bug (a broker dashboard shown in the account's base currency, not USD)
+    # this is guarding against.
+    cash: Money = field(default_factory=lambda: usd(0.0))
 
 
 def _stage1_gate_summary(result) -> dict:
@@ -281,10 +285,10 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
     # daily-loss and the current sector/cluster exposure — all needed before
     # the kill-switch check and the sizing gates that follow.
     held_positions = portfolio.list_positions()
-    price_by_ticker: dict[str, float] = {}
-    position_values: list[float] = []
-    sector_value: dict[str, float] = {}
-    cluster_value: dict[str, float] = {}
+    price_by_ticker: dict[str, float] = {}  # FMP quotes are always USD by construction — plain floats, not Money
+    position_values: list[Money] = []
+    sector_value: dict[str, Money] = {}
+    cluster_value: dict[str, Money] = {}
     for pos in held_positions:
         try:
             price = gateway.get_current_price(pos.ticker)
@@ -293,22 +297,22 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
             logger.warning("price fetch failed for held position ticker=%s error=%s", pos.ticker, exc)
             continue
         price_by_ticker[pos.ticker] = price
-        value = pos.qty * price
+        value = usd(pos.qty * price)
         position_values.append(value)
         sector = gateway.get_sector(pos.ticker)
         cluster = gateway.get_cluster(pos.ticker)
         if sector:
-            sector_value[sector] = sector_value.get(sector, 0.0) + value
+            sector_value[sector] = sector_value.get(sector, usd(0.0)) + value
         if cluster:
-            cluster_value[cluster] = cluster_value.get(cluster, 0.0) + value
+            cluster_value[cluster] = cluster_value.get(cluster, usd(0.0)) + value
 
-    nav_usd = compute_nav(position_values, inputs.cash_usd)
-    sector_pct = {k: v / nav_usd * 100 for k, v in sector_value.items()} if nav_usd else {}
-    cluster_pct = {k: v / nav_usd * 100 for k, v in cluster_value.items()} if nav_usd else {}
-    nav_status = record_nav(session, run_row.id, nav_usd, inputs.as_of)
+    nav = compute_nav(position_values, inputs.cash)
+    sector_pct = {k: (v / nav) * 100 for k, v in sector_value.items()} if nav.amount else {}
+    cluster_pct = {k: (v / nav) * 100 for k, v in cluster_value.items()} if nav.amount else {}
+    nav_status = record_nav(session, run_row.id, nav, inputs.as_of)
     logger.info(
-        "nav=%.2f peak=%.2f drawdown_pct=%.2f daily_loss_pct=%.2f",
-        nav_status.nav_usd, nav_status.peak_nav_usd, nav_status.drawdown_pct, nav_status.daily_loss_pct,
+        "nav=%s peak=%s drawdown_pct=%.2f daily_loss_pct=%.2f",
+        nav_status.nav, nav_status.peak_nav, nav_status.drawdown_pct, nav_status.daily_loss_pct,
     )
 
     # -------------------------------------------------------- Risk: run-level
@@ -343,8 +347,8 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
             config=config.risk,
         )
 
-        value_usd = pos.qty * current_price
-        weight_pct = (value_usd / nav_usd * 100) if nav_usd else 0.0
+        value_usd = pos.qty * current_price  # plain float — FMP quote, unambiguously USD
+        weight_pct = (value_usd / nav.amount * 100) if nav.amount else 0.0
         unrealized_pnl_pct = ((current_price - pos.avg_cost) / pos.avg_cost * 100) if pos.avg_cost else 0.0
 
         if evaluation.has_exit_signal:
@@ -399,7 +403,7 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
     # Running totals so approving one BUY reduces room for the next, within
     # the same run — a static snapshot would let two proposals in the same
     # cluster each look individually fine while together blowing the cap.
-    running_cash = inputs.cash_usd
+    running_cash = inputs.cash
     running_sector_pct = dict(sector_pct)
     running_cluster_pct = dict(cluster_pct)
 
@@ -418,12 +422,12 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
         sizing = size_new_position(
             conviction_score=scored.conviction,
             atr_pct_of_price=screener_input.technical.atr_pct_of_price,
-            nav_usd=nav_usd,
+            nav_usd=nav.amount,  # risk_rules.py operates in plain USD floats — explicit unwrap, not implicit
             sector=sector,
             cluster=cluster,
             current_sector_pct=running_sector_pct,
             current_cluster_pct=running_cluster_pct,
-            cash_available_usd=running_cash,
+            cash_available_usd=running_cash.amount,
             scaling=config.conviction_scaling,
             config=config.risk,
         )
@@ -452,7 +456,7 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
             )
         )
 
-        running_cash -= order.estimated_cost_usd
+        running_cash = running_cash - usd(order.estimated_cost_usd)
         if sector:
             running_sector_pct[sector] = running_sector_pct.get(sector, 0.0) + order.weight_pct
         if cluster:
@@ -470,7 +474,7 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
         book=book_entries,
         portfolio_health=PortfolioHealth(
             correlated_cluster_pct=cluster_pct,
-            cash_pct=(inputs.cash_usd / nav_usd * 100) if nav_usd else 0.0,
+            cash_pct=(inputs.cash / nav * 100) if nav.amount else 0.0,
             drawdown_from_peak_pct=nav_status.drawdown_pct,
             kill_switch=kill_status,
         ),

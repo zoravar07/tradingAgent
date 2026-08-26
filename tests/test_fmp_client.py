@@ -119,6 +119,26 @@ class TestFMPClientBasics:
         assert rows[0]["symbol"] == "AMD"
         assert session.calls[0][1]["symbol"] == "AMD"
 
+    def test_sp500_constituents_returns_sorted_unique_symbols(self, tmp_path):
+        client, session = make_client(
+            tmp_path,
+            {
+                "/v3/sp500_constituent": FakeResponse(
+                    payload=[{"symbol": "nvda"}, {"symbol": "AMD"}, {"symbol": "AMD"}]
+                )
+            },
+        )
+        constituents = client.get_sp500_constituents()
+        assert constituents == ["AMD", "NVDA"]
+
+    def test_sp500_constituents_is_one_call_regardless_of_pool_size(self, tmp_path):
+        client, session = make_client(
+            tmp_path, {"/v3/sp500_constituent": FakeResponse(payload=[{"symbol": f"T{i}"} for i in range(500)])}
+        )
+        client.get_sp500_constituents()
+        client.get_sp500_constituents()
+        assert len(session.calls) == 1  # second call served from cache
+
 
 class TestFMPFactorSource:
     def _responses(self):

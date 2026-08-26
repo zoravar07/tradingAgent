@@ -9,8 +9,29 @@ schedule:
 
 universe:
   include_holdings_always: true
-  screener_universe: SP500
   watchlist: [AMD, NVDA, MRVL, CRDO, NBIS, VRT, CLS, CEG, MP, PLTR, RKLB, SOFI, MSFT]
+  # Day-to-day universe = holdings + watchlist + a rotating slice of this
+  # pool, so the FMP call budget (250/day free tier) is never at risk.
+  # The full pool still gets covered over time — at 30/day it takes about
+  # 17 days to rotate through all ~500 S&P 500 names once.
+  rotating_pool_source: SP500
+  rotating_scan_size: 30
+  weekly_wide_scan:
+    enabled: false                 # flip on if you upgrade past the FMP free tier
+    day_of_week: 6                 # 0=Mon..6=Sun (Python weekday numbering) — Sunday by default
+  # §9's own note names these 10 tickers as "your AI/semis cluster" — that
+  # note is the source of this map, not a guess. Extend it for other themes.
+  cluster_overrides:
+    AMD: ai_semis
+    NVDA: ai_semis
+    MRVL: ai_semis
+    CRDO: ai_semis
+    NBIS: ai_semis
+    VRT: ai_semis
+    CLS: ai_semis
+    CEG: ai_semis
+    MP: ai_semis
+    PLTR: ai_semis
 
 screener:
   stage1:

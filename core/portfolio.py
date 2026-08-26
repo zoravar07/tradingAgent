@@ -62,6 +62,8 @@ _COST_PRICE_COLUMNS = ["CostBasisPrice", "AvgCost", "AverageCost", "OpenPrice"]
 _COST_MONEY_COLUMNS = ["CostBasisMoney", "CostBasis"]
 _ASSET_CLASS_COLUMNS = ["AssetClass"]
 _EQUITY_ASSET_CLASSES = {"STK"}
+_CASH_ASSET_CLASSES = {"CASH"}
+_CURRENCY_COLUMNS = ["CurrencyPrimary", "Currency"]
 
 
 class ReconciliationError(ValueError):
@@ -186,6 +188,47 @@ def parse_flex_csv(source: str | IO[str]) -> list[ImportedPosition]:
         out.append(ImportedPosition(ticker=ticker, qty=qty, avg_cost=avg_cost))
 
     return out
+
+
+def parse_flex_cash_balance(source: str | IO[str]) -> float | None:
+    """Sums CASH-classified rows' Position value from an IBKR Flex Query
+    export — added for core/nav.py's NAV calculation, on top of §2's
+    original CSV parsing which only cared about equities.
+
+    USD-only: a CurrencyPrimary column, if present, filters to USD rows
+    only. A multi-currency account needs this extended — a documented gap,
+    not a silent one. Returns None (not 0.0) when the balance can't be
+    determined at all — the caller must not confuse "no cash data in this
+    export" with "zero cash"."""
+    text = source.read() if hasattr(source, "read") else source
+    reader = csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames:
+        return None
+
+    header_map = _normalize_headers(reader.fieldnames)
+    asset_class_col = _find_column(header_map, _ASSET_CLASS_COLUMNS)
+    qty_col = _find_column(header_map, _QTY_COLUMNS)
+    if asset_class_col is None or qty_col is None:
+        return None
+    currency_col = _find_column(header_map, _CURRENCY_COLUMNS)
+
+    total = 0.0
+    found = False
+    for row in reader:
+        asset_class = (row.get(asset_class_col) or "").strip().upper()
+        if asset_class not in _CASH_ASSET_CLASSES:
+            continue
+        if currency_col is not None:
+            currency = (row.get(currency_col) or "").strip().upper()
+            if currency and currency != "USD":
+                continue
+        try:
+            total += float(row[qty_col])
+            found = True
+        except (TypeError, ValueError):
+            continue
+
+    return total if found else None
 
 
 def _costs_match(a: float, b: float) -> bool:
@@ -339,17 +382,26 @@ class PortfolioService:
     # ----------------------------------------------------------- CSV import
 
     def import_flex_csv(self, source: str | IO[str], filename: str) -> ReconciliationResult:
-        rows = parse_flex_csv(source)
+        text = source.read() if hasattr(source, "read") else source
+        rows = parse_flex_csv(text)
+        cash_usd = parse_flex_cash_balance(text)
         result = self.reconcile(rows, filename=filename)
         record = PositionImport(
             imported_at=result.imported_at,
             filename=filename,
             rows=result.rows,
             reconciliation_json=result.as_json(),
+            cash_usd=cash_usd,
         )
         self.session.add(record)
         self.session.flush()
         return result
+
+    def latest_cash_balance(self) -> float | None:
+        """None if there's never been an import, or the import's CSV had no
+        parseable cash row — distinct from an actual zero balance."""
+        last = self.last_import()
+        return last.cash_usd if last is not None else None
 
     def reconcile(
         self,

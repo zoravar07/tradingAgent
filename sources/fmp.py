@@ -173,6 +173,15 @@ class FMPClient:
         )
         return data or []
 
+    # ---------------------------------------------------------------- index
+
+    def get_sp500_constituents(self) -> list[str]:
+        """One call regardless of universe size — the rotating-pool source
+        for the day-to-day universe (see core/orchestrator.py's
+        resolve_universe). Membership changes rarely, hence the long TTL."""
+        data = self._get("/v3/sp500_constituent", ttl_seconds=TTL_OWNERSHIP_13F)  # reuse the ~30-day TTL
+        return sorted({row["symbol"].upper() for row in (data or []) if row.get("symbol")})
+
 
 class FMPFactorSource(FactorSource):
     """Adapts FMPClient to the §8.2 FactorSource interface. Pulls a broad

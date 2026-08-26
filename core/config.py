@@ -12,12 +12,35 @@ from __future__ import annotations
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class PortfolioConfig(BaseModel):
     import_reminder_days: int = 7
     allow_fractional: bool = False
+
+
+class WeeklyWideScanConfig(BaseModel):
+    """Off by default — needs a paid FMP tier to be worth turning on (a
+    full-pool scan on the wide-scan day still costs one call per name)."""
+
+    enabled: bool = False
+    day_of_week: int = Field(6, ge=0, le=6)  # 0=Monday .. 6=Sunday (Python's datetime.weekday())
+
+
+class UniverseConfig(BaseModel):
+    include_holdings_always: bool = True
+    watchlist: list[str] = []
+    rotating_pool_source: str = "SP500"
+    rotating_scan_size: int = 30
+    weekly_wide_scan: WeeklyWideScanConfig = WeeklyWideScanConfig()
+    # §9's note names these 10 tickers as "your AI/semis cluster" explicitly —
+    # copied here as the seed override map, not invented.
+    cluster_overrides: dict[str, str] = {
+        "AMD": "ai_semis", "NVDA": "ai_semis", "MRVL": "ai_semis", "CRDO": "ai_semis",
+        "NBIS": "ai_semis", "VRT": "ai_semis", "CLS": "ai_semis", "CEG": "ai_semis",
+        "MP": "ai_semis", "PLTR": "ai_semis",
+    }
 
 
 class Stage1Config(BaseModel):
@@ -101,6 +124,7 @@ class Config(BaseModel):
 
     version: int = 1
     portfolio: PortfolioConfig = PortfolioConfig()
+    universe: UniverseConfig = UniverseConfig()
     screener: ScreenerConfig = ScreenerConfig()
     risk: RiskConfig = RiskConfig()
     conviction_scaling: ConvictionScalingConfig = ConvictionScalingConfig()

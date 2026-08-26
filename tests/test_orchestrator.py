@@ -7,6 +7,7 @@ test_order_builder.py / test_briefing.py already).
 
 import datetime as dt
 
+import pytest
 from sqlalchemy import select
 
 from agents.research import BearCase, Catalyst, ResearchMemo
@@ -21,8 +22,9 @@ from core.config import (
     Stage2Config,
 )
 from core.llm import LLMClient, MonthlySpendTracker
-from core.models import Candidate, Conviction, Proposal, ResearchOutput, Run
-from core.orchestrator import NightlyRunInputs, build_universe, run_nightly
+from core.models import Candidate, Conviction, NavSnapshot, Proposal, ResearchOutput, Run
+from core.config import UniverseConfig, WeeklyWideScanConfig
+from core.orchestrator import NightlyRunInputs, build_universe, resolve_universe, rotating_slice, run_nightly
 from sources.prices import TechnicalSnapshot
 from tests.test_llm import FakeClient, FakeResponse
 
@@ -111,6 +113,70 @@ def make_llm(tmp_path, script):
     return LLMClient(FakeClient(script), MonthlySpendTracker(tmp_path / "spend.json", 40.0, month_fn=lambda: "2026-08"))
 
 
+class TestBuildUniverse:
+    def test_merges_and_dedupes(self):
+        result = build_universe(held_tickers=["nbis"], watchlist=["AMD", "NBIS"], scan_tickers=["MSFT", "AMD"])
+        assert result == ["NBIS", "AMD", "MSFT"]
+
+    def test_held_positions_come_first(self):
+        result = build_universe(held_tickers=["X"], watchlist=["A"], scan_tickers=["B"])
+        assert result[0] == "X"
+
+
+class TestRotatingSlice:
+    def test_basic_slice(self):
+        pool = ["A", "B", "C", "D", "E"]
+        assert rotating_slice(pool, batch_size=2, day_index=0) == ["A", "B"]
+
+    def test_rotates_on_day_index(self):
+        pool = ["A", "B", "C", "D", "E"]
+        assert rotating_slice(pool, batch_size=2, day_index=1) == ["C", "D"]
+
+    def test_wraps_around_pool(self):
+        pool = ["A", "B", "C", "D", "E"]
+        assert rotating_slice(pool, batch_size=2, day_index=2) == ["E", "A"]
+
+    def test_batch_size_larger_than_pool_returns_whole_pool(self):
+        pool = ["A", "B"]
+        assert set(rotating_slice(pool, batch_size=10, day_index=0)) == {"A", "B"}
+
+    def test_empty_pool_returns_empty(self):
+        assert rotating_slice([], batch_size=30, day_index=5) == []
+
+    def test_full_pool_gets_covered_over_enough_days(self):
+        pool = [f"T{i}" for i in range(100)]
+        covered: set[str] = set()
+        for day in range(100 // 10):
+            covered.update(rotating_slice(pool, batch_size=10, day_index=day))
+        assert covered == set(pool)
+
+
+class TestResolveUniverse:
+    def test_normal_day_uses_rotating_slice(self):
+        pool = [f"T{i}" for i in range(50)]
+        config = UniverseConfig(watchlist=["WATCH1"], rotating_scan_size=10)
+        result = resolve_universe(held_tickers=["HELD1"], pool=pool, config=config, as_of=dt.datetime(2026, 8, 25))
+        assert "HELD1" in result
+        assert "WATCH1" in result
+        assert len(result) == 12  # held(1) + watchlist(1) + rotating slice(10), none overlapping
+
+    def test_wide_scan_day_uses_full_pool(self):
+        pool = [f"T{i}" for i in range(50)]
+        config = UniverseConfig(
+            watchlist=[], rotating_scan_size=10, weekly_wide_scan=WeeklyWideScanConfig(enabled=True, day_of_week=1)
+        )
+        as_of = dt.datetime(2026, 8, 25)  # a Tuesday -> weekday() == 1
+        assert as_of.weekday() == 1
+        result = resolve_universe(held_tickers=[], pool=pool, config=config, as_of=as_of)
+        assert set(result) == set(pool)
+
+    def test_wide_scan_disabled_still_uses_rotating_slice(self):
+        pool = [f"T{i}" for i in range(50)]
+        config = UniverseConfig(watchlist=[], rotating_scan_size=10, weekly_wide_scan=WeeklyWideScanConfig(enabled=False))
+        result = resolve_universe(held_tickers=[], pool=pool, config=config, as_of=dt.datetime(2026, 8, 25))
+        assert len(result) == 10
+
+
 class TestFullNightlyRun:
     def test_end_to_end(self, session, portfolio, tmp_path):
         # --- held position, matching §3's NBIS example
@@ -143,12 +209,13 @@ class TestFullNightlyRun:
         llm = make_llm(tmp_path, script)
 
         config = make_config()
+        # NBIS position value (8 * $222 = $1,776) + this cash figure = $100,000 NAV,
+        # chosen to keep the sizing math identical to the previous fixed-NAV test.
         run_inputs = NightlyRunInputs(
             as_of=dt.datetime(2026, 8, 25, 22, 0, 0),
-            universe_tickers=build_universe(sp500_tickers=["AMD", "NVDA", "BADCO"], watchlist=[], held_tickers=["NBIS"]),
+            universe_tickers=build_universe(held_tickers=["NBIS"], watchlist=[], scan_tickers=["AMD", "NVDA", "BADCO"]),
             held_tickers=["NBIS"],
-            nav_usd=100_000,
-            cash_available_usd=50_000,
+            cash_usd=98_224.0,
         )
 
         briefing = run_nightly(session=session, config=config, gateway=gateway, llm=llm, portfolio=portfolio, inputs=run_inputs)
@@ -202,8 +269,24 @@ class TestFullNightlyRun:
         # --- LLM spend was tracked
         assert llm.budget.spent_this_month() > 0
 
+        # --- NAV computed from positions + cash, sector/cluster from held book
+        nav_row = session.execute(select(NavSnapshot)).scalar_one()
+        assert nav_row.nav_usd == pytest.approx(100_000.0)  # 8*222 (NBIS) + 98,224 cash
+        assert nav_row.drawdown_pct == 0.0  # first-ever snapshot
+        assert briefing.portfolio_health.cash_pct == pytest.approx(98.224, abs=0.01)
+
     def test_kill_switch_blocks_new_buys_but_not_exits(self, session, portfolio, tmp_path):
         portfolio.add_manual_position("NBIS", qty=8, avg_cost=218.0, opened_at=dt.datetime(2026, 7, 1), conviction_at_entry=68.0)
+
+        # Seed a prior NAV snapshot so record_nav has something to compare
+        # against — daily_loss_pct/drawdown_pct are now derived, not passed
+        # in, so triggering the kill switch means simulating an actual NAV
+        # decline across two runs rather than overriding a field directly.
+        prev_run = Run(started_at=dt.datetime(2026, 8, 24, 22, 0, 0), finished_at=dt.datetime(2026, 8, 24, 22, 5, 0), status="succeeded", config_snapshot_json="{}")
+        session.add(prev_run)
+        session.flush()
+        session.add(NavSnapshot(run_id=prev_run.id, nav_usd=100_000.0, peak_nav_usd=100_000.0, drawdown_pct=0.0, daily_loss_pct=0.0, recorded_at=dt.datetime(2026, 8, 24, 22, 0, 0)))
+        session.flush()
 
         inputs_by_ticker = {
             "NBIS": screener_input("NBIS", is_held=True),
@@ -218,13 +301,13 @@ class TestFullNightlyRun:
         ]
         llm = make_llm(tmp_path, script)
         config = make_config()
+        # NBIS value (8*222=1,776) + a small cash figure -> NAV of ~$10,000,
+        # a ~90% drop from yesterday's $100,000 snapshot -> kill switch trips.
         run_inputs = NightlyRunInputs(
             as_of=dt.datetime(2026, 8, 25, 22, 0, 0),
-            universe_tickers=build_universe(["AMD"], [], ["NBIS"]),
+            universe_tickers=build_universe(held_tickers=["NBIS"], watchlist=[], scan_tickers=["AMD"]),
             held_tickers=["NBIS"],
-            nav_usd=100_000,
-            cash_available_usd=50_000,
-            daily_loss_pct=10.0,  # above max_daily_loss_pct -> kill switch triggers
+            cash_usd=8_224.0,
         )
 
         briefing = run_nightly(session=session, config=config, gateway=gateway, llm=llm, portfolio=portfolio, inputs=run_inputs)
@@ -232,4 +315,5 @@ class TestFullNightlyRun:
         proposals = {p.ticker: p for p in session.execute(select(Proposal)).scalars()}
         assert "AMD" not in proposals  # kill switch blocked the new BUY
         assert "NBIS" in proposals  # but the thesis-decay exit still went through
+        assert briefing.portfolio_health.kill_switch.triggered is True
         assert proposals["NBIS"].action == "SELL"

@@ -2,22 +2,26 @@
 full pipeline once, persists every stage to the §6 tables so a run is fully
 replayable afterward, and returns the assembled §3 briefing.
 
-**Open question this module does NOT resolve**: §5 sets Universe = S&P500 +
-watchlist + all current holdings, and per-ticker data gathering (Stage 1's
-quant fields, Research's context text) costs several FMP calls each — S&P500
-alone is ~500 names against the 250-calls/day free-tier budget that
-sources/fmp.py's docstring already flagged as unsolved. This module takes a
-resolved `universe_tickers` list and a `MarketDataGateway` as inputs rather
-than deciding how to economically fetch 500 names' worth of data — that's a
-real decision (a paid FMP tier? a cheaper bulk/screener endpoint? a smaller
-day-to-day universe?) worth making deliberately. Flagged here, not guessed
-at, same as step 3.
+**Universe and FMP budget.** §5's "Universe = S&P500 + watchlist + all
+current holdings" doesn't fit the 250-calls/day free tier at ~500 names
+(step 3 flagged this first). Per the user's decision: the day-to-day
+universe is holdings + watchlist + a rotating slice of the S&P 500
+(`config.universe.rotating_scan_size`, default 30 — see `resolve_universe`
+and `rotating_slice`), so the full pool still gets covered over roughly
+`len(pool) / rotating_scan_size` days. `config.universe.weekly_wide_scan`
+can flip on a full-pool day for a paid FMP tier.
 
-Also not built here: computing `daily_loss_pct`/`drawdown_pct` from NAV
-history (needs a NAV time series this codebase doesn't track yet), and
-sector/correlated-cluster classification per ticker (needs a ticker-to-
-sector/cluster mapping the spec never defines a source for). Both are
-accepted as inputs to `run_nightly` rather than invented here.
+**NAV and drawdown** (not in §6's original schema — added per the user's
+request): NAV = sum of held positions' market value + cash (cash sourced
+from the most recent Flex import's cash row, see core/portfolio.py's
+`latest_cash_balance`). Drawdown and daily-loss are derived run-over-run by
+core/nav.py, starting at zero on the first recorded run.
+
+**Sector/cluster**: sector comes from the gateway (FMP's profile "sector"
+field, live gateway in sources/live_gateway.py); correlated-cluster
+membership comes from `config.universe.cluster_overrides` — an explicit
+map, not inferred, since the spec's own §9 note names the AI/semis cluster
+by ticker rather than by any classification rule.
 """
 
 from __future__ import annotations
@@ -25,7 +29,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Protocol
 
 from sqlalchemy import select
@@ -49,10 +53,11 @@ from core.briefing import (
     WatchlistItem as BriefingWatchlistItem,
     assemble_briefing,
 )
-from core.config import Config
+from core.config import Config, UniverseConfig
 from core.llm import LLMClient
 from core.models import Candidate, Conviction as ConvictionRow, Proposal, ResearchOutput, RiskEvent, Run
 from core.models import WatchlistItem as WatchlistItemRow
+from core.nav import compute_nav, record_nav
 from core.portfolio import PortfolioService
 from core.risk_rules import (
     ScoredProposal,
@@ -75,14 +80,13 @@ class MarketDataGateway(Protocol):
     def get_cluster(self, ticker: str) -> str | None: ...
 
 
-def build_universe(sp500_tickers: list[str], watchlist: list[str], held_tickers: list[str]) -> list[str]:
-    """§5: "Universe = S&P500 + watchlist + ALL current holdings." Held
-    positions are listed first so a caller iterating the universe in order
-    hits them before any API budget runs out — losing a held-position
-    evaluation is worse than losing a new-candidate screen."""
+def build_universe(held_tickers: list[str], watchlist: list[str], scan_tickers: list[str]) -> list[str]:
+    """Merges the three universe components, de-duplicated, held positions
+    first — so a partial run (budget exhausted partway through) never loses
+    a held-position evaluation before a new-candidate screen."""
     seen: list[str] = []
     seen_set: set[str] = set()
-    for group in (held_tickers, watchlist, sp500_tickers):
+    for group in (held_tickers, watchlist, scan_tickers):
         for raw in group:
             ticker = raw.upper()
             if ticker not in seen_set:
@@ -91,17 +95,38 @@ def build_universe(sp500_tickers: list[str], watchlist: list[str], held_tickers:
     return seen
 
 
+def rotating_slice(pool: list[str], batch_size: int, day_index: int) -> list[str]:
+    """Deterministically picks up to `batch_size` tickers from `pool`,
+    rotating which ones based on `day_index` (e.g. `date.toordinal()`) so
+    consecutive days cover different names and the full pool gets scanned
+    over `ceil(len(pool) / batch_size)` days."""
+    if not pool or batch_size <= 0:
+        return []
+    n = len(pool)
+    batch_size = min(batch_size, n)
+    start = (day_index * batch_size) % n
+    return [pool[(start + i) % n] for i in range(batch_size)]
+
+
+def resolve_universe(
+    *, held_tickers: list[str], pool: list[str], config: UniverseConfig, as_of: dt.datetime
+) -> list[str]:
+    """Ties `config.universe` together: a full-pool scan on the configured
+    weekly-wide-scan day (if enabled), otherwise a rotating slice sized to
+    `rotating_scan_size`, merged with holdings and the watchlist."""
+    if config.weekly_wide_scan.enabled and as_of.weekday() == config.weekly_wide_scan.day_of_week:
+        scan_tickers = pool
+    else:
+        scan_tickers = rotating_slice(pool, config.rotating_scan_size, as_of.toordinal())
+    return build_universe(held_tickers, config.watchlist, scan_tickers)
+
+
 @dataclass
 class NightlyRunInputs:
     as_of: dt.datetime
     universe_tickers: list[str]
     held_tickers: list[str]
-    nav_usd: float
-    cash_available_usd: float
-    daily_loss_pct: float = 0.0
-    drawdown_pct: float = 0.0
-    current_sector_pct: dict[str, float] = field(default_factory=dict)
-    current_cluster_pct: dict[str, float] = field(default_factory=dict)
+    cash_usd: float = 0.0
 
 
 def _stage1_gate_summary(result) -> dict:
@@ -245,8 +270,43 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
         )
     session.flush()
 
+    # ------------------------------------------------- NAV, sector, cluster pass
+    # One pass over held positions to price them, then derive NAV/drawdown/
+    # daily-loss and the current sector/cluster exposure — all needed before
+    # the kill-switch check and the sizing gates that follow.
+    held_positions = portfolio.list_positions()
+    price_by_ticker: dict[str, float] = {}
+    position_values: list[float] = []
+    sector_value: dict[str, float] = {}
+    cluster_value: dict[str, float] = {}
+    for pos in held_positions:
+        try:
+            price = gateway.get_current_price(pos.ticker)
+        except Exception as exc:  # noqa: BLE001
+            session.add(RiskEvent(run_id=run_row.id, type="DATA_FETCH_FAILED", detail_json=json.dumps({"ticker": pos.ticker, "stage": "current_price", "error": str(exc)})))
+            logger.warning("price fetch failed for held position ticker=%s error=%s", pos.ticker, exc)
+            continue
+        price_by_ticker[pos.ticker] = price
+        value = pos.qty * price
+        position_values.append(value)
+        sector = gateway.get_sector(pos.ticker)
+        cluster = gateway.get_cluster(pos.ticker)
+        if sector:
+            sector_value[sector] = sector_value.get(sector, 0.0) + value
+        if cluster:
+            cluster_value[cluster] = cluster_value.get(cluster, 0.0) + value
+
+    nav_usd = compute_nav(position_values, inputs.cash_usd)
+    sector_pct = {k: v / nav_usd * 100 for k, v in sector_value.items()} if nav_usd else {}
+    cluster_pct = {k: v / nav_usd * 100 for k, v in cluster_value.items()} if nav_usd else {}
+    nav_status = record_nav(session, run_row.id, nav_usd, inputs.as_of)
+    logger.info(
+        "nav=%.2f peak=%.2f drawdown_pct=%.2f daily_loss_pct=%.2f",
+        nav_status.nav_usd, nav_status.peak_nav_usd, nav_status.drawdown_pct, nav_status.daily_loss_pct,
+    )
+
     # -------------------------------------------------------- Risk: run-level
-    kill_status = check_kill_switches(inputs.daily_loss_pct, inputs.drawdown_pct, config.risk)
+    kill_status = check_kill_switches(nav_status.daily_loss_pct, nav_status.drawdown_pct, config.risk)
     if kill_status.triggered:
         session.add(RiskEvent(run_id=run_row.id, type="KILL_SWITCH", detail_json=json.dumps({"reasons": kill_status.reasons})))
         logger.warning("kill switch triggered reasons=%s", kill_status.reasons)
@@ -254,13 +314,10 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
     # ---------------------------------------------------- Held positions: exits
     action_items: list[ActionItem] = []
     book_entries: list[BookEntry] = []
-    for pos in portfolio.list_positions():
-        try:
-            current_price = gateway.get_current_price(pos.ticker)
-        except Exception as exc:  # noqa: BLE001
-            session.add(RiskEvent(run_id=run_row.id, type="DATA_FETCH_FAILED", detail_json=json.dumps({"ticker": pos.ticker, "stage": "current_price", "error": str(exc)})))
-            logger.warning("price fetch failed for held position ticker=%s error=%s", pos.ticker, exc)
-            continue
+    for pos in held_positions:
+        current_price = price_by_ticker.get(pos.ticker)
+        if current_price is None:
+            continue  # fetch already failed and was logged above
 
         pos.peak_price_since_activation = update_peak_price(pos.peak_price_since_activation, current_price)
 
@@ -281,7 +338,7 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
         )
 
         value_usd = pos.qty * current_price
-        weight_pct = (value_usd / inputs.nav_usd * 100) if inputs.nav_usd else 0.0
+        weight_pct = (value_usd / nav_usd * 100) if nav_usd else 0.0
         unrealized_pnl_pct = ((current_price - pos.avg_cost) / pos.avg_cost * 100) if pos.avg_cost else 0.0
 
         if evaluation.has_exit_signal:
@@ -333,6 +390,13 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
             new_proposals.append(ScoredProposal(ticker=ticker, conviction=conviction))
     capped = enforce_daily_proposal_cap(new_proposals, config.risk)
 
+    # Running totals so approving one BUY reduces room for the next, within
+    # the same run — a static snapshot would let two proposals in the same
+    # cluster each look individually fine while together blowing the cap.
+    running_cash = inputs.cash_usd
+    running_sector_pct = dict(sector_pct)
+    running_cluster_pct = dict(cluster_pct)
+
     for scored in capped:
         screener_input = screener_inputs.get(scored.ticker)
         if screener_input is None:
@@ -343,15 +407,17 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
             logger.warning("price fetch failed for candidate ticker=%s error=%s", scored.ticker, exc)
             continue
 
+        sector = gateway.get_sector(scored.ticker)
+        cluster = gateway.get_cluster(scored.ticker)
         sizing = size_new_position(
             conviction_score=scored.conviction,
             atr_pct_of_price=screener_input.technical.atr_pct_of_price,
-            nav_usd=inputs.nav_usd,
-            sector=gateway.get_sector(scored.ticker),
-            cluster=gateway.get_cluster(scored.ticker),
-            current_sector_pct=inputs.current_sector_pct,
-            current_cluster_pct=inputs.current_cluster_pct,
-            cash_available_usd=inputs.cash_available_usd,
+            nav_usd=nav_usd,
+            sector=sector,
+            cluster=cluster,
+            current_sector_pct=running_sector_pct,
+            current_cluster_pct=running_cluster_pct,
+            cash_available_usd=running_cash,
             scaling=config.conviction_scaling,
             config=config.risk,
         )
@@ -379,6 +445,12 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
                 created_at=inputs.as_of,
             )
         )
+
+        running_cash -= order.estimated_cost_usd
+        if sector:
+            running_sector_pct[sector] = running_sector_pct.get(sector, 0.0) + order.weight_pct
+        if cluster:
+            running_cluster_pct[cluster] = running_cluster_pct.get(cluster, 0.0) + order.weight_pct
     session.flush()
 
     # -------------------------------------------------------------- Watching
@@ -391,8 +463,9 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
         overnight_changes=_overnight_changes(stage2_results, held_set),
         book=book_entries,
         portfolio_health=PortfolioHealth(
-            correlated_cluster_pct=inputs.current_cluster_pct,
-            cash_pct=(inputs.cash_available_usd / inputs.nav_usd * 100) if inputs.nav_usd else 0.0,
+            correlated_cluster_pct=cluster_pct,
+            cash_pct=(inputs.cash_usd / nav_usd * 100) if nav_usd else 0.0,
+            drawdown_from_peak_pct=nav_status.drawdown_pct,
             kill_switch=kill_status,
         ),
         drift=portfolio.check_drift(as_of=inputs.as_of),

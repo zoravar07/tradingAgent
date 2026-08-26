@@ -43,6 +43,11 @@ class PositionImport(Base):
     filename: Mapped[str] = mapped_column(String, nullable=False)
     rows: Mapped[int] = mapped_column(Integer, nullable=False)
     reconciliation_json: Mapped[str] = mapped_column(Text, nullable=False)
+    # Added alongside core/nav.py: the account's cash balance as of this
+    # import, read from the Flex Query CSV's CASH rows. Nullable because
+    # older imports (before this column existed) and manual-only books
+    # won't have one.
+    cash_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 class Run(Base):
@@ -147,3 +152,22 @@ class ConfigVersion(Base):
     yaml_text: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, nullable=False)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class NavSnapshot(Base):
+    """Not in §6's original schema — added for the drawdown/daily-loss
+    tracking the user asked for on top of the spec: "drawdown history builds
+    up from run to run — start it at zero on first run." One row per run;
+    `peak_nav_usd` and `drawdown_pct` are derived by comparing against the
+    single prior row, same never-recompute-from-scratch pattern as
+    positions.peak_price_since_activation (§6)."""
+
+    __tablename__ = "nav_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("runs.id"), nullable=False)
+    nav_usd: Mapped[float] = mapped_column(Float, nullable=False)
+    peak_nav_usd: Mapped[float] = mapped_column(Float, nullable=False)
+    drawdown_pct: Mapped[float] = mapped_column(Float, nullable=False)
+    daily_loss_pct: Mapped[float] = mapped_column(Float, nullable=False)
+    recorded_at: Mapped[dt.datetime] = mapped_column(DateTime, nullable=False)

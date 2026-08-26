@@ -7,6 +7,7 @@ from core.portfolio import (
     ImportedPosition,
     PortfolioError,
     ReconciliationError,
+    parse_flex_cash_balance,
     parse_flex_csv,
 )
 from tests.conftest import FIXTURES
@@ -288,3 +289,53 @@ class TestDrift:
         status = svc.check_drift(as_of=dt_(0))
         assert status.stale is True
         assert status.threshold_days == 1
+
+
+# ------------------------------------------------------------- cash balance
+
+class TestParseFlexCashBalance:
+    def test_reads_cash_row_from_fixture(self):
+        csv_text = (FIXTURES / "flex_open_positions.csv").read_text()
+        assert parse_flex_cash_balance(csv_text) == pytest.approx(15320.44)
+
+    def test_none_when_no_cash_rows(self):
+        csv_text = "AssetClass,Symbol,Position,CostBasisPrice\nSTK,AMD,10,142.30\n"
+        assert parse_flex_cash_balance(csv_text) is None
+
+    def test_none_when_no_asset_class_column(self):
+        csv_text = "Symbol,Position,CostBasisPrice\nAMD,10,142.30\n"
+        assert parse_flex_cash_balance(csv_text) is None
+
+    def test_sums_multiple_cash_rows(self):
+        csv_text = (
+            "AssetClass,CurrencyPrimary,Symbol,Position\n"
+            "CASH,USD,USD,1000.00\n"
+            "CASH,USD,USD,50.25\n"
+            "STK,USD,AMD,10\n"
+        )
+        assert parse_flex_cash_balance(csv_text) == pytest.approx(1050.25)
+
+    def test_filters_out_non_usd_currency(self):
+        csv_text = (
+            "AssetClass,CurrencyPrimary,Symbol,Position\n"
+            "CASH,USD,USD,1000.00\n"
+            "CASH,EUR,EUR,500.00\n"
+        )
+        assert parse_flex_cash_balance(csv_text) == pytest.approx(1000.00)
+
+
+class TestLatestCashBalance:
+    def test_none_before_any_import(self, portfolio):
+        assert portfolio.latest_cash_balance() is None
+
+    def test_returns_most_recent_imports_cash(self, portfolio):
+        csv_text = (FIXTURES / "flex_open_positions.csv").read_text()
+        portfolio.import_flex_csv(csv_text, filename="flex_open_positions.csv")
+        assert portfolio.latest_cash_balance() == pytest.approx(15320.44)
+
+    def test_updates_on_second_import(self, portfolio):
+        csv1 = "AssetClass,CurrencyPrimary,Symbol,Position,CostBasisPrice\nCASH,USD,USD,1000.00,\n"
+        csv2 = "AssetClass,CurrencyPrimary,Symbol,Position,CostBasisPrice\nCASH,USD,USD,2500.00,\n"
+        portfolio.import_flex_csv(csv1, filename="day1.csv")
+        portfolio.import_flex_csv(csv2, filename="day2.csv")
+        assert portfolio.latest_cash_balance() == pytest.approx(2500.00)

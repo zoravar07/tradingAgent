@@ -71,6 +71,11 @@ class RiskConfig(BaseModel):
     thesis_decay_trigger_pts: float = 15.0
 
 
+class ResearchConfig(BaseModel):
+    model: str = "claude-sonnet-4-6"
+    max_candidates_per_run: int = 15
+
+
 class BudgetConfig(BaseModel):
     monthly_api_cap_usd: float = 40
 
@@ -86,6 +91,7 @@ class Config(BaseModel):
     risk: RiskConfig = RiskConfig()
     conviction_scaling: ConvictionScalingConfig = ConvictionScalingConfig()
     conviction_weights: dict[str, float] = {}
+    research: ResearchConfig = ResearchConfig()
     budget: BudgetConfig = BudgetConfig()
 
 

@@ -6,11 +6,12 @@ test_order_builder.py / test_briefing.py already).
 """
 
 import datetime as dt
+import json
 
 import pytest
 from sqlalchemy import select
 
-from agents.research import BearCase, Catalyst, ResearchMemo
+from agents.research import BearCase, Catalyst, ResearchMemo, Subscore
 from agents.screener import ScreenerInput, Stage2Verdict
 from core.config import (
     Config,
@@ -65,7 +66,11 @@ def screener_input(ticker, is_held=False, market_cap_usd=5_000_000_000, adv=50_0
 
 def memo(**overrides) -> ResearchMemo:
     subscore = overrides.pop("subscore", 50.0)
-    base = {name: subscore for name in CONVICTION_WEIGHTS}
+    base = {name: Subscore(value=subscore, data_available=True) for name in CONVICTION_WEIGHTS}
+    for name in CONVICTION_WEIGHTS:
+        if name in overrides:
+            value = overrides.pop(name)
+            base[name] = Subscore(value=None, data_available=False) if value is None else Subscore(value=value, data_available=True)
     base.update(
         consensus_view="consensus", variant_view="variant",
         bear_case=BearCase(thesis="bear thesis", estimated_downside_pct=25),
@@ -594,3 +599,30 @@ class TestEtfExemption:
         assert briefing.unresearched_holdings == []
         assert briefing.book[0].no_research_coverage is False
         assert briefing.book[0].conviction_now == 55.0
+
+
+class TestUnavailableFactorsPersistence:
+    def test_memos_unavailable_factors_land_in_research_output_reasoning_json(self, session, portfolio, tmp_path):
+        portfolio.add_manual_position("NBIS", qty=4, avg_cost=192.0, conviction_at_entry=68.0)
+        gateway = FakeGateway(inputs={"NBIS": screener_input("NBIS", is_held=True)}, prices={"NBIS": 200.0})
+        script = [
+            FakeResponse(parsed_output=Stage2Verdict(verdict="x", material=False)),
+            FakeResponse(parsed_output=memo(subscore=60.0, ownership_flow=None, catalyst_path=None)),
+        ]
+        llm = make_llm(tmp_path, script)
+        config = make_config()
+        run_inputs = NightlyRunInputs(
+            as_of=dt.datetime(2026, 8, 25, 22, 0, 0),
+            universe_tickers=build_universe(held_tickers=["NBIS"], watchlist=[], scan_tickers=[]),
+            held_tickers=["NBIS"],
+            cash=usd(100.0),
+        )
+
+        run_nightly(session=session, config=config, gateway=gateway, llm=llm, portfolio=portfolio, inputs=run_inputs)
+
+        research_output = session.execute(select(ResearchOutput)).scalar_one()
+        reasoning = json.loads(research_output.reasoning_json)
+        assert set(reasoning["unavailable_factors"]) == {"ownership_flow", "catalyst_path"}
+        subscores = json.loads(research_output.subscores_json)
+        assert "ownership_flow" not in subscores
+        assert "catalyst_path" not in subscores

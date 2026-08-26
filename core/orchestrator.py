@@ -306,7 +306,7 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
                 run_id=run_row.id,
                 ticker=rr.ticker,
                 subscores_json=json.dumps(memo.subscores()),
-                reasoning_json=json.dumps({}),
+                reasoning_json=json.dumps({"unavailable_factors": memo.unavailable_factors()}),
                 consensus_view=memo.consensus_view,
                 variant_view=memo.variant_view,
                 bear_case_json=json.dumps(memo.bear_case.model_dump()),

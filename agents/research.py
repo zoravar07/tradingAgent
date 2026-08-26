@@ -28,13 +28,35 @@ Gathering the input context (FMP fundamentals, technical snapshot, earnings,
 ownership, news) is the orchestrator's job (§10 step 9, not yet built) — this
 module takes an already-assembled `ResearchContext.context_text` and doesn't
 fetch anything itself.
+
+**Null subscores, added after a real finding**: a live run showed
+`ownership_flow` (and, to a lesser extent, `catalyst_path` and
+`downside_asymmetry`) clustering near 40 across every researched name
+regardless of company quality — correlated with 13F/insider data being
+frequently unavailable. The root cause wasn't those specific factors; it was
+that a subscore had no way to say "I have no evidence here" — a plain 0-100
+float always produces *some* number, and an LLM asked to score without real
+data defaults to a hedged, uninformative middle rather than an honest
+absence. That number then gets weighted into the roll-up as if it were a
+finding, quietly dragging conviction toward the middle for every name with a
+data gap, not just the ones that genuinely warrant a neutral score.
+
+Each subscore is now a `Subscore` (value + an explicit `data_available`
+flag) instead of a bare float. When `data_available` is False, `subscores()`
+excludes that factor entirely — and core/scoring.py's `compute_conviction`
+already renormalizes weights over whatever's present (§8.3: "weights
+auto-normalise to 1.0 regardless of what's enabled"), so a missing factor
+contributes nothing rather than a fabricated middle. This is deliberately
+the general fix, not a 13F/insider-specific one — it's cheap (one schema
+change) and it corrects the same failure mode for any factor, on any
+ticker, any time the evidence just isn't there.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from core.config import ResearchConfig
 from core.llm import LLMClient, UsageRecord
@@ -58,6 +80,8 @@ RESEARCH_SUBSCORE_NAMES = [
 ]
 
 RESEARCH_SYSTEM_PROMPT = """You are an equity research analyst producing a structured investment memo for one candidate at a time. Score each factor 0-100 based only on the evidence given to you in the user message — do not invent data you weren't given.
+
+Each factor is scored as an object: {"value": <0-100 or null>, "data_available": <true or false>}. If the user message gives you no real evidence to judge a factor on — not "the evidence is mixed" or "this looks average", but genuinely nothing to go on (e.g. no 13F/insider data was provided, no analyst coverage exists) — set data_available to false and leave value null. Do NOT default to a middling number like 40-60 when you have no evidence; that number gets treated as a real finding downstream and it isn't one. Only set data_available to true when you're scoring actual evidence, even evidence that itself points to a middling picture.
 
 Factor definitions (§5.2 of the house research spec):
 - business_quality: ROIC and its trend. Gross margin durability — pricing power or commodity exposure? Reinvestment runway.
@@ -93,18 +117,35 @@ class BearCase(BaseModel):
     estimated_downside_pct: float = Field(ge=0, le=100)
 
 
+class Subscore(BaseModel):
+    """One factor's judgment. `data_available=False` means the memo found no
+    real evidence to score this factor on — `value` must then be null, not a
+    hedged middling number. See module docstring for why this exists."""
+
+    value: float | None = Field(default=None, ge=0, le=100)
+    data_available: bool
+
+    @model_validator(mode="after")
+    def _value_matches_availability(self) -> "Subscore":
+        if self.data_available and self.value is None:
+            raise ValueError("data_available=True requires a non-null value")
+        if not self.data_available and self.value is not None:
+            raise ValueError("data_available=False must leave value null, not a number")
+        return self
+
+
 class ResearchMemo(BaseModel):
-    business_quality: float = Field(ge=0, le=100)
-    financial_health: float = Field(ge=0, le=100)
-    whats_priced_in: float = Field(ge=0, le=100)
-    variant_perception: float = Field(ge=0, le=100)
-    earnings_quality: float = Field(ge=0, le=100)
-    catalyst_path: float = Field(ge=0, le=100)
-    downside_asymmetry: float = Field(ge=0, le=100)
-    ownership_flow: float = Field(ge=0, le=100)
-    analyst_signals: float = Field(ge=0, le=100)
-    news_sentiment: float = Field(ge=0, le=100)
-    technical_momentum: float = Field(ge=0, le=100)
+    business_quality: Subscore
+    financial_health: Subscore
+    whats_priced_in: Subscore
+    variant_perception: Subscore
+    earnings_quality: Subscore
+    catalyst_path: Subscore
+    downside_asymmetry: Subscore
+    ownership_flow: Subscore
+    analyst_signals: Subscore
+    news_sentiment: Subscore
+    technical_momentum: Subscore
 
     consensus_view: str
     variant_view: str
@@ -116,8 +157,22 @@ class ResearchMemo(BaseModel):
     def subscores(self) -> dict[str, float]:
         """§6's research_outputs.subscores_json — everything compute_conviction
         needs, minus portfolio_fit/discord_signal which are merged in by the
-        caller from elsewhere (see module docstring)."""
-        return {name: getattr(self, name) for name in RESEARCH_SUBSCORE_NAMES}
+        caller from elsewhere (see module docstring). Factors marked
+        data_available=False are excluded entirely, not passed through as
+        some fallback number — core/scoring.py's compute_conviction
+        renormalizes weights over whatever's left."""
+        result: dict[str, float] = {}
+        for name in RESEARCH_SUBSCORE_NAMES:
+            sub: Subscore = getattr(self, name)
+            if sub.data_available and sub.value is not None:
+                result[name] = sub.value
+        return result
+
+    def unavailable_factors(self) -> list[str]:
+        """Factors this memo explicitly found no evidence for — a research-
+        quality signal worth surfacing (e.g. in the UI), not just an internal
+        detail of the conviction roll-up."""
+        return [name for name in RESEARCH_SUBSCORE_NAMES if not getattr(self, name).data_available]
 
 
 @dataclass

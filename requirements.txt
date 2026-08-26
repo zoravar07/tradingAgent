@@ -9,3 +9,4 @@ pytest>=8.0
 requests>=2.31
 python-dotenv>=1.0
 anthropic>=0.69  # core/llm.py's AnthropicClient protocol matches this SDK's messages.parse()
+croniter>=2.0  # core/schedule.py — reads config.yaml's schedule.nightly_run cron string

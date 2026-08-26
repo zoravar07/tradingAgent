@@ -86,6 +86,10 @@ class OrderBuilderConfig(BaseModel):
     profit_trim_fraction: float = 0.5  # fraction of the position sold when PROFIT_BAND triggers
 
 
+class ScheduleConfig(BaseModel):
+    nightly_run: str = "0 22 * * 0-4"
+
+
 class BudgetConfig(BaseModel):
     monthly_api_cap_usd: float = 40
 
@@ -103,6 +107,7 @@ class Config(BaseModel):
     conviction_weights: dict[str, float] = {}
     research: ResearchConfig = ResearchConfig()
     order_builder: OrderBuilderConfig = OrderBuilderConfig()
+    schedule: ScheduleConfig = ScheduleConfig()
     budget: BudgetConfig = BudgetConfig()
 
 

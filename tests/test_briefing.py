@@ -260,3 +260,16 @@ class TestUnresearchedHoldings:
         briefing = assemble_briefing(**self.base_kwargs(book=book))
         text = render_briefing_text(briefing)
         assert "conviction n/a" in text
+
+    def test_fresh_conviction_without_entry_baseline_is_shown_not_hidden(self):
+        # regression test for a real bug found during the first live run
+        # against real positions: every manually-entered position lacks a
+        # conviction_at_entry, so a real fresh conviction_now was rendering
+        # as "conviction n/a" — indistinguishable from no research having
+        # happened at all, even though research genuinely ran this run.
+        book = [book_entry("AMD", conviction_now=54.0, conviction_at_entry=None)]
+        briefing = assemble_briefing(**self.base_kwargs(book=book))
+        text = render_briefing_text(briefing)
+        assert "conviction 54" in text
+        assert "conviction n/a" not in text
+        assert "NO RESEARCH COVERAGE" not in text

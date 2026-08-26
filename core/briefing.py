@@ -261,6 +261,12 @@ def render_briefing_text(briefing: Briefing) -> str:
     for b in briefing.book:
         if b.conviction_now is not None and b.conviction_at_entry is not None:
             conv = f"conviction {b.conviction_now:.0f} (was {b.conviction_at_entry:.0f})"
+        elif b.conviction_now is not None:
+            # a real fresh score exists this run, just no recorded entry
+            # baseline to compare it to (true for every manually-entered
+            # position without a conviction_at_entry — showing "n/a" here
+            # would hide a real number the run actually computed)
+            conv = f"conviction {b.conviction_now:.0f} (no entry baseline)"
         elif b.no_research_coverage:
             conv = "⚠ NO RESEARCH COVERAGE"
         else:

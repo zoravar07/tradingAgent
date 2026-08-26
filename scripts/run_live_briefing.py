@@ -128,7 +128,11 @@ def main() -> None:
 
     yf_cache = FileCache(ROOT / "data" / "yf_cache")
     yf_client = YFinanceClient(cache=yf_cache)
-    gateway = LiveMarketDataGateway(fmp_client, yf_client, cluster_overrides=config.universe.cluster_overrides)
+    gateway = LiveMarketDataGateway(
+        fmp_client, yf_client,
+        cluster_overrides=config.universe.cluster_overrides,
+        etf_tickers=config.universe.etf_tickers,
+    )
 
     anthropic_client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
     llm_budget = MonthlySpendTracker(ROOT / "data" / "llm_spend.json", config.budget.monthly_api_cap_usd)

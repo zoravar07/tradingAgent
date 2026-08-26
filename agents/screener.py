@@ -45,6 +45,12 @@ class ScreenerInput:
     revenue_growth_pct: float | None = None
     days_to_earnings: int | None = None
     is_held: bool = False
+    # User-requested, not in §5.1: an ETF has no income statement to have a
+    # floor on — judging one on FCF/revenue growth is a category error, not
+    # a data gap. Explicit flag (config.universe.etf_tickers), not inferred
+    # from a data source, matching cluster_overrides' pattern — see
+    # sources/live_gateway.py.
+    is_etf: bool = False
 
 
 @dataclass
@@ -101,13 +107,17 @@ def evaluate_stage1(item: ScreenerInput, config: Stage1Config) -> Stage1Result:
         if item.avg_daily_volume_usd is None or item.avg_daily_volume_usd < config.min_avg_daily_volume_usd:
             reasons.append("avg daily volume below floor")
 
-    positive_fcf = item.free_cash_flow is not None and item.free_cash_flow > 0
-    growth_above_threshold = (
-        item.revenue_growth_pct is not None and item.revenue_growth_pct >= config.min_revenue_growth_pct
-    )
-    fundamental_floor_pass = positive_fcf or growth_above_threshold
-    if not fundamental_floor_pass:
-        reasons.append("no positive FCF and revenue growth below threshold")
+    if item.is_etf:
+        fundamental_floor_pass = True  # a fund has no P&L to have a floor on — exempt, not failing
+        reasons.append("ETF — fundamental floor not applicable")
+    else:
+        positive_fcf = item.free_cash_flow is not None and item.free_cash_flow > 0
+        growth_above_threshold = (
+            item.revenue_growth_pct is not None and item.revenue_growth_pct >= config.min_revenue_growth_pct
+        )
+        fundamental_floor_pass = positive_fcf or growth_above_threshold
+        if not fundamental_floor_pass:
+            reasons.append("no positive FCF and revenue growth below threshold")
 
     gates = Stage1GateResults(
         liquidity_pass=liquidity_pass,

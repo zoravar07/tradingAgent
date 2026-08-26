@@ -4,6 +4,7 @@ from core.config import ConvictionScalingConfig, RiskConfig
 from core.risk_rules import (
     ScoredProposal,
     check_kill_switches,
+    conviction_floor_triggered,
     enforce_daily_proposal_cap,
     evaluate_held_position,
     lerp_by_conviction,
@@ -279,3 +280,63 @@ class TestEvaluateHeldPosition:
             config=RISK,
         )
         assert [t.type for t in evaluation.triggers] == ["THESIS_DECAY"]
+
+    def test_conviction_floor_fires_with_no_price_move_and_no_baseline(self):
+        # the RKLB/MP gap: no entry baseline, price hasn't dropped, but
+        # conviction is just low — nothing else would ever catch this
+        evaluation = evaluate_held_position(
+            ticker="RKLB",
+            current_price=105,  # up slightly, nowhere near a profit band
+            avg_cost=100,
+            peak_price=106,  # tight enough peak that a sane ATR shouldn't breach
+            atr_14=2.0,
+            conviction_now=36.4,
+            conviction_at_entry=None,  # no baseline recorded
+            scaling=SCALING,
+            config=RISK,
+        )
+        assert [t.type for t in evaluation.triggers] == ["CONVICTION_FLOOR"]
+
+    def test_conviction_floor_does_not_fire_at_or_above_threshold(self):
+        evaluation = evaluate_held_position(
+            ticker="AMD", current_price=105, avg_cost=100, peak_price=106, atr_14=2.0,
+            conviction_now=40.0, conviction_at_entry=None, scaling=SCALING, config=RISK,
+        )
+        assert evaluation.has_exit_signal is False
+
+    def test_conviction_floor_suppressed_when_conviction_not_fresh(self):
+        # an unresearched position must not exit on a fabricated fallback
+        # conviction_now, same principle as thesis-decay's own guard
+        evaluation = evaluate_held_position(
+            ticker="RKLB", current_price=105, avg_cost=100, peak_price=106, atr_14=2.0,
+            conviction_now=30.0, conviction_at_entry=None, scaling=SCALING, config=RISK,
+            conviction_is_fresh=False,
+        )
+        assert evaluation.has_exit_signal is False
+
+    def test_conviction_floor_is_lowest_priority(self):
+        # rig it so trailing stop AND the conviction floor would both fire
+        evaluation = evaluate_held_position(
+            ticker="AMD", current_price=100, avg_cost=50, peak_price=102, atr_14=1.0,
+            conviction_now=0, conviction_at_entry=None, scaling=SCALING, config=RISK,
+        )
+        types = [t.type for t in evaluation.triggers]
+        assert "TRAILING_STOP" in types
+        assert "CONVICTION_FLOOR" in types
+        assert evaluation.primary_trigger.type == "TRAILING_STOP"
+
+
+class TestConvictionFloor:
+    def test_triggers_below_threshold(self):
+        triggered, detail = conviction_floor_triggered(36.4, RISK)
+        assert triggered is True
+        assert detail["conviction_now"] == 36.4
+        assert detail["min_hold_conviction"] == RISK.min_hold_conviction
+
+    def test_no_trigger_at_threshold(self):
+        triggered, _ = conviction_floor_triggered(RISK.min_hold_conviction, RISK)
+        assert triggered is False
+
+    def test_no_trigger_above_threshold(self):
+        triggered, _ = conviction_floor_triggered(70.0, RISK)
+        assert triggered is False

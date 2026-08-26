@@ -203,7 +203,10 @@ class HeldPositionEvaluation:
     def primary_trigger(self) -> ExitTrigger | None:
         """§5.3 lists them in priority order: trailing stop breach · profit
         band crossed · thesis decay. First triggered in that order wins when
-        a single label is needed (e.g. proposals.trigger_type)."""
+        a single label is needed (e.g. proposals.trigger_type).
+        CONVICTION_FLOOR (not in §5.3, user-requested) is checked last —
+        it's the catch-all for a position none of the other three caught,
+        so it never outranks a real price- or decay-based signal."""
         return self.triggers[0] if self.triggers else None
 
 
@@ -255,6 +258,18 @@ def thesis_decay_triggered(
     }
 
 
+def conviction_floor_triggered(conviction_now: float, config: RiskConfig) -> tuple[bool, dict]:
+    """User-requested absolute floor: unlike trailing-stop/profit-band
+    (need favorable price action) and thesis-decay (needs a recorded entry
+    baseline), this fires on conviction_now alone — the trigger of last
+    resort for a position that's just bad, never having gone up and never
+    having had a baseline to decay from. See RiskConfig.min_hold_conviction."""
+    return conviction_now < config.min_hold_conviction, {
+        "conviction_now": conviction_now,
+        "min_hold_conviction": config.min_hold_conviction,
+    }
+
+
 def evaluate_held_position(
     ticker: str,
     current_price: float,
@@ -265,7 +280,14 @@ def evaluate_held_position(
     conviction_at_entry: float | None,
     scaling: ConvictionScalingConfig,
     config: RiskConfig,
+    conviction_is_fresh: bool = True,
 ) -> HeldPositionEvaluation:
+    """`conviction_is_fresh=False` means `conviction_now` is a fallback, not
+    a real score computed this run (see core/orchestrator.py) — thesis-decay
+    is already guarded by `conviction_at_entry` being passed as None in that
+    case, but the conviction floor has no such guard of its own, since it
+    only looks at conviction_now. Suppressing it here keeps both triggers
+    off a fabricated number, not just the one whose guard happened to cover it."""
     triggers: list[ExitTrigger] = []
 
     stop_hit, stop_detail = trailing_stop_breached(current_price, peak_price, atr_14, conviction_now, scaling)
@@ -279,5 +301,10 @@ def evaluate_held_position(
     decay_hit, decay_detail = thesis_decay_triggered(conviction_now, conviction_at_entry, config)
     if decay_hit:
         triggers.append(ExitTrigger(type="THESIS_DECAY", detail=decay_detail))
+
+    if conviction_is_fresh:
+        floor_hit, floor_detail = conviction_floor_triggered(conviction_now, config)
+        if floor_hit:
+            triggers.append(ExitTrigger(type="CONVICTION_FLOOR", detail=floor_detail))
 
     return HeldPositionEvaluation(ticker=ticker, triggers=triggers)

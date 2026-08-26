@@ -46,6 +46,12 @@ class UniverseConfig(BaseModel):
         "NBIS": "ai_semis", "VRT": "ai_semis", "CLS": "ai_semis", "CEG": "ai_semis",
         "MP": "ai_semis", "PLTR": "ai_semis",
     }
+    # User-requested, not in the spec: ETFs have no income statement to be
+    # judged on — explicit list, not inferred (same reasoning as
+    # cluster_overrides above), so screener.py can exempt them from the
+    # fundamental-floor gate instead of failing them for a structural
+    # non-issue. Seeded with this user's own core_longterm sleeve (§9).
+    etf_tickers: list[str] = ["VTI", "VGT", "IAU"]
 
 
 class Stage1Config(BaseModel):
@@ -97,6 +103,14 @@ class RiskConfig(BaseModel):
     reference_atr_pct_of_price: float = 3.0
     min_volatility_size_multiplier: float = 0.25
     thesis_decay_trigger_pts: float = 15.0
+    # User-requested, not in the spec: every other exit trigger needs
+    # either price movement (trailing stop, profit band) or a recorded
+    # entry conviction to compare against (thesis decay) — a position
+    # that's simply bad, with no baseline and no favorable price action,
+    # never triggers anything under those three alone. This is an absolute
+    # floor: conviction_now below this always proposes an exit for a held
+    # position, regardless of P&L or whether an entry baseline exists.
+    min_hold_conviction: float = 40.0
     # User-requested hard gate, not in the spec: NAV is only as good as
     # every held position being priced. Zero tolerance by default — if more
     # than this many held positions can't be priced, the whole run halts

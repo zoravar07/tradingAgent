@@ -38,6 +38,12 @@ universe:
     CEG: ai_semis
     MP: ai_semis
     PLTR: ai_semis
+  # Not in the spec — added after a live run flagged a false "no research
+  # coverage" alarm for these three. ETFs have no income statement in any
+  # data source; the fundamental-floor gate is a category error for them,
+  # not a data gap. Seeded with this user's own core_longterm sleeve (§9's
+  # comment: "VTI, VGT, IAU — held, not actively traded").
+  etf_tickers: [VTI, VGT, IAU]
 
 screener:
   stage1:
@@ -92,6 +98,13 @@ risk:
   # silently zeroed out part of NAV. Zero tolerance: any held position that
   # can't be priced halts the whole run rather than publish on a broken NAV.
   max_unpriced_held_positions: 0
+  # Not in the spec — added after a live run where RKLB (conviction 36) and
+  # MP (38) generated no proposal despite memos describing accelerating
+  # cash burn: they had no entry baseline (thesis decay can't fire) and
+  # hadn't dropped in price (no trailing stop/profit band either). A
+  # position below this conviction always gets a proposed exit, regardless
+  # of P&L or whether an entry baseline exists.
+  min_hold_conviction: 40.0
 
 conviction_weights:                 # auto-normalised; add or remove freely
   business_quality: 0.15

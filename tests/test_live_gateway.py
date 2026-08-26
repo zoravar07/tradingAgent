@@ -19,7 +19,7 @@ def bars_payload(n=210, start=100.0, step=0.1):
     return [bar(f"2026-01-{(i % 28) + 1:02d}", start + i * step) for i in range(n)]
 
 
-def make_gateway(tmp_path, fmp_responses, prices=None, histories=None, yf_income=None, yf_cash_flow=None, cluster_overrides=None):
+def make_gateway(tmp_path, fmp_responses, prices=None, histories=None, yf_income=None, yf_cash_flow=None, cluster_overrides=None, etf_tickers=None):
     """`prices`: {ticker: float}. `histories`: {ticker: list[dict rows]}.
     `yf_income`/`yf_cash_flow`: {ticker: list[raw yfinance-shaped dict rows]}.
     Missing entries raise YFinanceError, mimicking a real lookup failure."""
@@ -59,16 +59,16 @@ def make_gateway(tmp_path, fmp_responses, prices=None, histories=None, yf_income
         income_statement_raw_fetcher=income_fetcher, cash_flow_raw_fetcher=cash_flow_fetcher,
     )
 
-    gateway = LiveMarketDataGateway(fmp_client, yf_client, cluster_overrides=cluster_overrides)
+    gateway = LiveMarketDataGateway(fmp_client, yf_client, cluster_overrides=cluster_overrides, etf_tickers=etf_tickers)
     return gateway, fmp_session
 
 
 class TestGetScreenerInput:
     def _fmp_responses(self):
         return {
-            "profile#AMD": FakeResponse(payload=[{"symbol": "AMD", "mktCap": 5_000_000_000, "volAvg": 40_000_000, "pe": 22.5, "sector": "Technology"}]),
-            "quote#AMD": FakeResponse(payload=[{"symbol": "AMD", "price": 150.0, "pe": 22.5}]),
-            "income-statement#AMD": FakeResponse(payload=[{"revenue": 1100}, {"revenue": 1000}]),
+            "profile#AMD": FakeResponse(payload=[{"symbol": "AMD", "mktCap": 5_000_000_000, "averageVolume": 40_000_000, "sector": "Technology"}]),
+            "quote#AMD": FakeResponse(payload=[{"symbol": "AMD", "price": 150.0}]),
+            "income-statement#AMD": FakeResponse(payload=[{"revenue": 1100, "eps": 10.0}, {"revenue": 1000, "eps": 9.0}]),
             "cash-flow-statement#AMD": FakeResponse(payload=[{"freeCashFlow": 200}]),
         }
 
@@ -84,7 +84,7 @@ class TestGetScreenerInput:
         assert result.ticker == "AMD"
         assert result.market_cap_usd == 5_000_000_000
         assert result.avg_daily_volume_usd == 40_000_000 * 150.0
-        assert result.trailing_pe == 22.5
+        assert result.trailing_pe == pytest.approx(150.0 / 10.0)  # price / eps — no direct P/E field anywhere
         assert result.free_cash_flow == 200
         assert result.days_to_earnings is None  # documented gap
 
@@ -99,7 +99,7 @@ class TestGetScreenerInput:
 
     def test_covers_an_etf_fmp_quote_gated_in_the_real_account(self, tmp_path):
         responses = {
-            "profile#VTI": FakeResponse(payload=[{"symbol": "VTI", "mktCap": None, "volAvg": 3_000_000}]),
+            "profile#VTI": FakeResponse(payload=[{"symbol": "VTI", "mktCap": None, "averageVolume": 3_000_000}]),
             "quote#VTI": FakeResponse(status_code=402, text="Restricted Endpoint"),
             "income-statement#VTI": FakeResponse(payload=[]),
             "cash-flow-statement#VTI": FakeResponse(payload=[]),
@@ -111,12 +111,13 @@ class TestGetScreenerInput:
         assert result.technical.last_price is not None  # yfinance bars flowed through for an FMP-quote-gated ETF
         assert result.technical.sma_200 is not None
 
-    def test_falls_back_to_yfinance_when_fmp_fundamentals_402(self, tmp_path):
+    def test_uses_yfinance_fundamentals_even_when_fmp_also_402s(self, tmp_path):
         # regression test for the second real-account discovery: FMP gates
-        # income-statement/cash-flow-statement the same way it gates quote
+        # income-statement/cash-flow-statement the same way it gates quote.
+        # yfinance is primary now (see module docstring for why), so this
+        # succeeds regardless of FMP's state — included to prove that.
         responses = {
-            "profile#CEG": FakeResponse(payload=[{"symbol": "CEG", "mktCap": 90_000_000_000, "volAvg": 2_000_000}]),
-            "quote#CEG": FakeResponse(status_code=402, text="Restricted Endpoint"),
+            "profile#CEG": FakeResponse(payload=[{"symbol": "CEG", "mktCap": 90_000_000_000, "averageVolume": 2_000_000}]),
             "income-statement#CEG": FakeResponse(status_code=402, text="Restricted Endpoint"),
             "cash-flow-statement#CEG": FakeResponse(status_code=402, text="Restricted Endpoint"),
         }
@@ -131,6 +132,23 @@ class TestGetScreenerInput:
         assert result.free_cash_flow == 300.0
         assert result.revenue_growth_pct == pytest.approx((1000.0 - 900.0) / 900.0 * 100)
 
+    def test_falls_back_to_fmp_when_yfinance_has_nothing(self, tmp_path):
+        # the genuine fallback path: yfinance has no data for this ticker,
+        # FMP does — inverted from the pre-budget-fix behavior
+        responses = {
+            "profile#CEG": FakeResponse(payload=[{"symbol": "CEG", "mktCap": 90_000_000_000, "averageVolume": 2_000_000}]),
+            "income-statement#CEG": FakeResponse(payload=[{"revenue": 1000, "eps": 5.0}, {"revenue": 900, "eps": 4.5}]),
+            "cash-flow-statement#CEG": FakeResponse(payload=[{"freeCashFlow": 300}]),
+        }
+        gateway, session = make_gateway(
+            tmp_path, responses, prices={"CEG": 278.42},
+            histories={"CEG": bars_payload(start=250.0), "SPY": bars_payload(start=500.0, step=0.05)},
+            # no yf_income/yf_cash_flow entries for CEG -> yfinance fetch fails
+        )
+        result = gateway.get_screener_input("CEG", is_held=True)
+        assert result.free_cash_flow == 300
+        assert result.revenue_growth_pct == pytest.approx((1000 - 900) / 900 * 100)
+
     def test_raises_when_both_fmp_and_yfinance_fundamentals_fail(self, tmp_path):
         responses = {
             "profile#CEG": FakeResponse(payload=[{"symbol": "CEG"}]),
@@ -143,6 +161,28 @@ class TestGetScreenerInput:
         )
         with pytest.raises(RuntimeError, match="income statement unavailable"):
             gateway.get_screener_input("CEG", is_held=True)
+
+    def test_etf_skips_fundamentals_fetch_entirely_and_sets_is_etf(self, tmp_path):
+        # VGT/IAU/VTI have no income statement in either source — an ETF
+        # must not even attempt (and fail) that fetch, per the config flag
+        responses = {"profile#VGT": FakeResponse(payload=[{"symbol": "VGT", "mktCap": None, "averageVolume": 500_000, "sector": "Technology"}])}
+        gateway, session = make_gateway(
+            tmp_path, responses, prices={"VGT": 620.0}, histories={"VGT": bars_payload(start=500.0), "SPY": bars_payload(start=500.0, step=0.05)},
+            etf_tickers=["VGT", "IAU", "VTI"],
+        )
+        result = gateway.get_screener_input("VGT", is_held=True)
+        assert result.is_etf is True
+        assert result.free_cash_flow is None
+        assert result.revenue_growth_pct is None
+        assert not any(c[0].endswith("/income-statement") or "income-statement" in c[0] for c in session.calls)
+
+    def test_non_etf_ticker_unaffected_by_etf_list(self, tmp_path):
+        gateway, session = make_gateway(
+            tmp_path, self._fmp_responses(), prices={"AMD": 150.0}, histories=self._histories(),
+            etf_tickers=["VGT", "IAU", "VTI"],
+        )
+        result = gateway.get_screener_input("AMD", is_held=False)
+        assert result.is_etf is False
 
     def test_revenue_growth_computed_from_two_periods(self, tmp_path):
         gateway, session = make_gateway(
@@ -229,26 +269,30 @@ class TestGetResearchContext:
         responses = self._base_responses()
         responses["institutional-ownership/symbol-positions-summary"] = FakeResponse(payload=[])
         responses["insider-trading"] = FakeResponse(payload=[])
-        gateway, session = make_gateway(tmp_path, responses, prices={"AMD": 150.0}, histories=self._histories())
+        gateway, session = make_gateway(
+            tmp_path, responses, prices={"AMD": 150.0}, histories=self._histories(),
+            yf_income={"AMD": [{"date": "2026-01-01", "Total Revenue": 1100.0, "Basic EPS": 10.0}]},
+            yf_cash_flow={"AMD": [{"date": "2026-01-01", "Free Cash Flow": 200.0}]},
+        )
         text = gateway.get_research_context("AMD")
         assert "AMD" in text
         assert "Technology" in text
         assert "Technical snapshot" in text
         assert "150.0" in text  # yfinance price appears, not a bare FMP quote
-        assert "source=fmp" in text  # FMP worked here, no fallback needed
+        assert "source=yfinance" in text  # yfinance is primary; FMP not needed here
+        assert "source=fmp_fallback" not in text
 
-    def test_context_names_yfinance_fallback_when_fmp_fundamentals_fail(self, tmp_path):
+    def test_context_names_fmp_fallback_when_yfinance_has_nothing(self, tmp_path):
+        # the genuine fallback path, inverted from the pre-budget-fix design:
+        # yfinance has no data for this ticker, FMP does
         responses = self._base_responses()
-        responses["income-statement"] = FakeResponse(status_code=402, text="Restricted Endpoint")
-        responses["cash-flow-statement"] = FakeResponse(status_code=402, text="Restricted Endpoint")
-        gateway, session = make_gateway(
+        text_gateway, session = make_gateway(
             tmp_path, responses, prices={"AMD": 150.0}, histories=self._histories(),
-            yf_income={"AMD": [{"date": "2026-01-01", "Total Revenue": 1100.0}]},
-            yf_cash_flow={"AMD": [{"date": "2026-01-01", "Free Cash Flow": 200.0}]},
+            # no yf_income/yf_cash_flow entries -> yfinance fetch fails, falls through to FMP
         )
-        text = gateway.get_research_context("AMD")
-        assert "source=yfinance_fallback" in text
-        assert "1100.0" in text  # the fallback data actually made it into the text
+        text = text_gateway.get_research_context("AMD")
+        assert "source=fmp_fallback" in text
+        assert "1100" in text  # the FMP fallback data made it into the text
 
     def test_13f_and_insider_and_price_failures_degrade_gracefully(self, tmp_path):
         responses = self._base_responses()
@@ -270,3 +314,16 @@ class TestGetResearchContext:
         text = gateway.get_research_context("AMD")  # must not raise even with everything FMP-side down
         assert "AMD" in text
         assert "150.0" in text  # yfinance data survives even total FMP outage
+
+    def test_etf_context_skips_fundamentals_and_says_so(self, tmp_path):
+        responses = {"profile": FakeResponse(payload=[{"companyName": "Vanguard Growth ETF", "sector": None}])}
+        gateway, session = make_gateway(
+            tmp_path, responses, prices={"VGT": 620.0},
+            histories={"VGT": bars_payload(start=500.0), "SPY": bars_payload(start=500.0, step=0.05)},
+            etf_tickers=["VGT"],
+        )
+        text = gateway.get_research_context("VGT")
+        assert "not applicable — this is an ETF" in text
+        assert "Technical snapshot" in text
+        # none of the FMP fundamentals endpoints were even attempted
+        assert not any("income-statement" in c[0] or "insider-trading" in c[0] for c in session.calls)

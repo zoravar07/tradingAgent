@@ -509,3 +509,88 @@ class TestUnresearchedHoldings:
 
         assert briefing.unresearched_holdings == []
         assert briefing.book[0].no_research_coverage is False
+
+
+class TestConvictionFloorIntegration:
+    def test_low_conviction_held_position_gets_an_exit_proposal(self, session, portfolio, tmp_path):
+        # reproduces the exact live-run gap: RKLB, no entry baseline, price
+        # essentially flat since purchase — nothing else would ever fire
+        portfolio.add_manual_position("RKLB", qty=3, avg_cost=120.0, conviction_at_entry=None)
+        gateway = FakeGateway(
+            inputs={"RKLB": screener_input("RKLB", technical=technical(atr_14=2.0))},
+            prices={"RKLB": 122.0},  # up slightly, nowhere near a profit band
+        )
+        script = [
+            FakeResponse(parsed_output=Stage2Verdict(verdict="weak", material=True)),
+            FakeResponse(parsed_output=memo(subscore=36.4, thesis_summary="accelerating cash burn")),
+        ]
+        llm = make_llm(tmp_path, script)
+        config = make_config()
+        run_inputs = NightlyRunInputs(
+            as_of=dt.datetime(2026, 8, 25, 22, 0, 0),
+            universe_tickers=build_universe(held_tickers=["RKLB"], watchlist=[], scan_tickers=[]),
+            held_tickers=["RKLB"],
+            cash=usd(100.0),
+        )
+
+        briefing = run_nightly(session=session, config=config, gateway=gateway, llm=llm, portfolio=portfolio, inputs=run_inputs)
+
+        proposals = {p.ticker: p for p in session.execute(select(Proposal)).scalars()}
+        assert "RKLB" in proposals
+        assert proposals["RKLB"].action == "SELL"
+        assert proposals["RKLB"].trigger_type == "CONVICTION_FLOOR"
+        assert [a.order.ticker for a in briefing.actions_today] == ["RKLB"]
+        assert briefing.actions_today[0].headline.startswith("Conviction below floor")
+
+    def test_conviction_at_or_above_floor_gets_no_proposal(self, session, portfolio, tmp_path):
+        portfolio.add_manual_position("RKLB", qty=3, avg_cost=120.0, conviction_at_entry=None)
+        gateway = FakeGateway(
+            inputs={"RKLB": screener_input("RKLB", technical=technical(atr_14=2.0))},
+            prices={"RKLB": 122.0},
+        )
+        script = [
+            FakeResponse(parsed_output=Stage2Verdict(verdict="ok", material=True)),
+            FakeResponse(parsed_output=memo(subscore=40.0)),  # exactly at the floor
+        ]
+        llm = make_llm(tmp_path, script)
+        config = make_config()
+        run_inputs = NightlyRunInputs(
+            as_of=dt.datetime(2026, 8, 25, 22, 0, 0),
+            universe_tickers=build_universe(held_tickers=["RKLB"], watchlist=[], scan_tickers=[]),
+            held_tickers=["RKLB"],
+            cash=usd(100.0),
+        )
+
+        briefing = run_nightly(session=session, config=config, gateway=gateway, llm=llm, portfolio=portfolio, inputs=run_inputs)
+
+        assert briefing.actions_today == []
+
+
+class TestEtfExemption:
+    def test_held_etf_gets_researched_normally_no_false_banner(self, session, portfolio, tmp_path):
+        # regression test: VGT (etc.) has no fundamentals in either source,
+        # but is_etf=True must make it flow through the pipeline like any
+        # other held position, not land in unresearched_holdings
+        portfolio.add_manual_position("VGT", qty=14, avg_cost=95.0)
+        gateway = FakeGateway(
+            inputs={"VGT": screener_input("VGT", is_held=True, is_etf=True)},
+            prices={"VGT": 117.0},
+        )
+        script = [
+            FakeResponse(parsed_output=Stage2Verdict(verdict="etf, no news", material=False)),
+            FakeResponse(parsed_output=memo(subscore=55.0)),
+        ]
+        llm = make_llm(tmp_path, script)
+        config = make_config()
+        run_inputs = NightlyRunInputs(
+            as_of=dt.datetime(2026, 8, 25, 22, 0, 0),
+            universe_tickers=build_universe(held_tickers=["VGT"], watchlist=[], scan_tickers=[]),
+            held_tickers=["VGT"],
+            cash=usd(100.0),
+        )
+
+        briefing = run_nightly(session=session, config=config, gateway=gateway, llm=llm, portfolio=portfolio, inputs=run_inputs)
+
+        assert briefing.unresearched_holdings == []
+        assert briefing.book[0].no_research_coverage is False
+        assert briefing.book[0].conviction_now == 55.0

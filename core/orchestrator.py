@@ -409,6 +409,12 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
             conviction_at_entry=pos.conviction_at_entry if has_fresh_conviction else None,
             scaling=config.conviction_scaling,
             config=config.risk,
+            # Same reasoning as the conviction_at_entry guard above: the
+            # conviction floor (§ user-requested, core/risk_rules.py) looks
+            # at conviction_now alone, so it needs its own explicit guard
+            # against firing on a fabricated fallback rather than relying on
+            # thesis-decay's guard to somehow cover it too.
+            conviction_is_fresh=has_fresh_conviction,
         )
 
         value_usd = pos.qty * current_price  # plain float — FMP quote, unambiguously USD
@@ -424,6 +430,7 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
                     "TRAILING_STOP": "Trailing stop triggered",
                     "PROFIT_BAND": f"Trim {int(config.order_builder.profit_trim_fraction * 100)}%",
                     "THESIS_DECAY": "Thesis decay",
+                    "CONVICTION_FLOOR": f"Conviction below floor ({config.risk.min_hold_conviction:.0f})",
                 }.get(evaluation.primary_trigger.type, "Exit triggered")
                 memo = memo_by_ticker.get(pos.ticker)
                 action_items.append(

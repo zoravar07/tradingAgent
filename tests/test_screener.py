@@ -94,6 +94,24 @@ class TestFundamentalFloor:
         )
         assert result.gates.fundamental_floor_pass is True
 
+    def test_etf_exempt_with_no_fundamentals_data_at_all(self):
+        # regression test: VGT/IAU/VTI have no income statement in either
+        # data source — this must be an exemption, not the same failure as
+        # a company with genuinely bad fundamentals
+        result = evaluate_stage1(
+            candidate(is_etf=True, free_cash_flow=None, revenue_growth_pct=None), DEFAULT_CONFIG
+        )
+        assert result.gates.fundamental_floor_pass is True
+        assert result.passed is True
+        assert "ETF — fundamental floor not applicable" in result.reasons
+
+    def test_etf_flag_does_not_affect_liquidity_gate(self):
+        result = evaluate_stage1(
+            candidate(is_etf=True, market_cap_usd=None, free_cash_flow=None, revenue_growth_pct=None), DEFAULT_CONFIG
+        )
+        assert result.gates.liquidity_pass is False
+        assert result.passed is False  # ETF exemption is fundamentals-only, not a blanket pass
+
 
 class TestValuationBand:
     def test_cheap(self):

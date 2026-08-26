@@ -1,0 +1,55 @@
+@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap");
+@import "tailwindcss";
+
+/*
+ * Zopro is a single-user local dashboard, not a marketing surface — it
+ * commits to one dark theme by design (spec §7: "dark, dense, data-first"),
+ * not a light/dark toggle. Tokens live here as CSS variables so components
+ * never hardcode a hex value.
+ *
+ * Palette: neutral zinc ground, one locked UI accent (signal blue) for
+ * interactive/active state, and separate, non-negotiable financial
+ * semantics (gain green / loss red / risk amber) — those aren't "the brand
+ * accent", they're domain convention and must stay legible on their own.
+ */
+@theme {
+  --font-sans: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", monospace;
+
+  --color-ground: #0a0a0d;
+  --color-panel: #131318;
+  --color-panel-raised: #1a1a21;
+  --color-hairline: #262631;
+  --color-hairline-strong: #34343f;
+
+  --color-ink: #e8e8ee;
+  --color-ink-dim: #9d9daa;
+  --color-ink-faint: #64646f;
+
+  --color-accent: #4f8bff;
+  --color-accent-dim: #2c4a8c;
+  --color-accent-wash: #16233d;
+
+  --color-gain: #3fb67f;
+  --color-gain-wash: #12241b;
+  --color-loss: #e5594f;
+  --color-loss-wash: #2a1614;
+  --color-risk: #d9a441;
+  --color-risk-wash: #2a2013;
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  background: var(--color-ground);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+}
+
+/* Numeric/tabular data reads as mono throughout — see design read. */
+.num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}

@@ -405,6 +405,17 @@ class TestPricingGate:
         assert session.execute(select(Proposal)).first() is None
         assert session.execute(select(NavSnapshot)).first() is None
 
+        # the blocked briefing is persisted too (§10 step 10 gap) — the UI
+        # must be able to surface today's block, not silently keep showing
+        # the last succeeded run as if nothing happened.
+        from core.briefing_persistence import deserialize_briefing
+        from core.models import BriefingRecord
+
+        record = session.execute(select(BriefingRecord).where(BriefingRecord.run_id == run_row.id)).scalar_one()
+        stored = deserialize_briefing(record.briefing_json)
+        assert stored["blocked"]["unpriced_positions"][0]["ticker"] == "NBIS"
+        assert stored["book"] == []
+
     def test_all_positions_priced_runs_normally(self, session, portfolio, tmp_path):
         portfolio.add_manual_position("NBIS", qty=8, avg_cost=218.0, conviction_at_entry=68.0)
         inputs_by_ticker = {"NBIS": screener_input("NBIS", is_held=True)}

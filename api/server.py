@@ -17,11 +17,11 @@ from api.routes.briefing import router as briefing_router
 from core.db import init_db, make_engine, make_session_factory
 
 ROOT = Path(__file__).resolve().parent.parent
-DB_PATH = ROOT / "data" / "zopro.db"
+DB_PATH = ROOT / "data" / "z_money.db"
 
 
 def create_app(db_path: str | Path = DB_PATH) -> FastAPI:
-    app = FastAPI(title="Zopro API")
+    app = FastAPI(title="Z Money API")
 
     app.add_middleware(
         CORSMiddleware,

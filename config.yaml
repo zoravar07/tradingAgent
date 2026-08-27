@@ -6,7 +6,7 @@ portfolio:
   # output, which always produces whole-share BUY/exit quantities via
   # floor()/int() math regardless of this flag (agents/order_builder.py).
   # This account trades fractional shares (IBKR fractional-share investing),
-  # so existing holdings can be fractional even though every order Zopro
+  # so existing holdings can be fractional even though every order Z Money
   # itself proposes is whole-share by construction.
   allow_fractional: true
 

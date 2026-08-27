@@ -17,7 +17,7 @@ class Base(DeclarativeBase):
 
 
 class Position(Base):
-    """One open position. Zopro's own book — the source of truth, reconciled
+    """One open position. Z Money's own book — the source of truth, reconciled
     against Flex Query imports but not blindly replaced by them (§2)."""
 
     __tablename__ = "positions"

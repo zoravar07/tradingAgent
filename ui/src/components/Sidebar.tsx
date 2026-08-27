@@ -21,7 +21,7 @@ export function Sidebar() {
       <div className="flex items-center gap-2 px-5 py-5">
         <span className="h-2 w-2 rounded-full bg-[var(--color-accent)]" />
         <span className="text-sm font-semibold tracking-[0.14em] text-[var(--color-ink)]">
-          ZOPRO
+          Z MONEY
         </span>
       </div>
 

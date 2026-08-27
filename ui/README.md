@@ -1,32 +1,26 @@
-# React + TypeScript + Vite
+# Z Money — UI
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+Vite + React + TypeScript + Tailwind v4 frontend for Z Money. See the
+project root [README.md](../README.md) for what Z Money is and how to run
+the backend it talks to.
 
-Currently, two official plugins are available:
-
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
-
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+```bash
+npm install
+npm run dev
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+Expects the API at `http://localhost:8000` (see `../api/server.py`).
+
+## Structure
+
+```
+src/routes/       one component per sidebar screen
+src/components/   shared UI atoms + per-screen subcomponents (components/briefing/, components/settings/)
+src/api/          fetch wrappers for the FastAPI backend
+src/types/        TypeScript types mirroring the backend's dataclasses/Pydantic models
+src/lib/          formatting helpers
+```
+
+No component library, by design — see the root spec's §7 (avoid a
+templated-dashboard look). Dark theme only; design tokens live in
+`src/index.css`.

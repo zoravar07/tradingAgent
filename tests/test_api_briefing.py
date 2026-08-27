@@ -1,5 +1,5 @@
 """API tests — FastAPI's TestClient against an isolated temp-file DB per
-test (create_app(db_path=...)), never the real data/zopro.db. No network."""
+test (create_app(db_path=...)), never the real data/z_money.db. No network."""
 
 import datetime as dt
 

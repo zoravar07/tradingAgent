@@ -189,7 +189,7 @@ def render_briefing_text(briefing: Briefing) -> str:
     looking at pipeline output before there's a UI (step 10) to show it in.
     Not meant to be the UI itself."""
     lines: list[str] = []
-    lines.append(f"=== ZOPRO BRIEFING — {briefing.generated_at:%Y-%m-%d %H:%M} ===")
+    lines.append(f"=== Z MONEY BRIEFING — {briefing.generated_at:%Y-%m-%d %H:%M} ===")
     lines.append("")
 
     if briefing.blocked is not None:

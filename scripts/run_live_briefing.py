@@ -1,6 +1,6 @@
 """One-off diagnostic script: a real, live end-to-end run against FMP,
 yfinance, and Anthropic, using whatever positions are already in
-data/zopro.db. Prints the assembled briefing as plain text and what the run
+data/z_money.db. Prints the assembled briefing as plain text and what the run
 cost. Prices/historicals come from yfinance (free, uncapped); fundamentals/
 earnings/analysts/13F stay on FMP — see sources/live_gateway.py.
 
@@ -84,7 +84,7 @@ def main() -> None:
     load_dotenv(ROOT / ".env")
     config = load_config(ROOT / "config.yaml")
 
-    engine = make_engine(ROOT / "data" / "zopro.db")
+    engine = make_engine(ROOT / "data" / "z_money.db")
     init_db(engine)
     session = make_session_factory(engine)()
     portfolio = PortfolioService(session, config=config.portfolio)

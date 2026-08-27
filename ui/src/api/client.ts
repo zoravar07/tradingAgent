@@ -13,7 +13,7 @@ export async function fetchLatestBriefing(): Promise<LatestBriefingResponse> {
     res = await fetch(`${API_BASE}/briefing/latest`);
   } catch {
     throw new ApiError(
-      "Can't reach the Zopro API. Is it running? (.venv/bin/uvicorn api.server:app --reload --port 8000)",
+      "Can't reach the Z Money API. Is it running? (.venv/bin/uvicorn api.server:app --reload --port 8000)",
     );
   }
   if (!res.ok) {

@@ -74,7 +74,7 @@ from core.risk_rules import (
 )
 from core.scoring import compute_conviction
 
-logger = logging.getLogger("zopro.orchestrator")
+logger = logging.getLogger("z_money.orchestrator")
 
 
 class MarketDataGateway(Protocol):

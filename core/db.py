@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from core.models import Base
 
-DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "zopro.db"
+DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "z_money.db"
 
 
 def make_engine(db_path: str | Path = DEFAULT_DB_PATH):

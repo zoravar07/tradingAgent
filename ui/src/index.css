@@ -2,7 +2,7 @@
 @import "tailwindcss";
 
 /*
- * Zopro is a single-user local dashboard, not a marketing surface — it
+ * Z Money is a single-user local dashboard, not a marketing surface — it
  * commits to one dark theme by design (spec §7: "dark, dense, data-first"),
  * not a light/dark toggle. Tokens live here as CSS variables so components
  * never hardcode a hex value.

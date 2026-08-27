@@ -18,7 +18,7 @@ against this for cash specifically.
 
 This is NOT a general-purpose currency/forex library — it does no
 conversion, and arithmetic between different currencies raises rather than
-silently mixing them. If Zopro ever needs true multi-currency accounts,
+silently mixing them. If Z Money ever needs true multi-currency accounts,
 this needs real conversion logic, not just a bigger version of this class.
 """
 

@@ -1,11 +1,11 @@
 """Portfolio module — §10 build-order step 2.
 
-Owns Zopro's own `positions` table (the source of truth, per §2) and the three
+Owns Z Money's own `positions` table (the source of truth, per §2) and the three
 ways positions get into it:
 
   1. `import_flex_csv`   — IBKR Flex Query "Open Positions" CSV, reconciled
                             against the current book.
-  2. `mark_filled`       — you placed an order manually in IBKR; tell Zopro
+  2. `mark_filled`       — you placed an order manually in IBKR; tell Z Money
                             what actually filled and it updates its book.
   3. `add_manual_position` / `edit_manual_position` / `remove_position`
                             — hand entry, mainly for the initial load.
@@ -14,7 +14,7 @@ Design notes that aren't obvious from the spec text alone:
 
 * Reconciliation trusts the CSV as ground truth for *what's actually held*.
   An IBKR "Open Positions" Flex Query lists every open position in the
-  account, so a ticker present in Zopro's book but absent from the CSV really
+  account, so a ticker present in Z Money's book but absent from the CSV really
   is gone (sold outside the app, a bad manual entry, a mark-filled mistake) —
   removing it is correct, not destructive-by-accident. Every change
   reconciliation makes is recorded in `reconciliation_json` on the
@@ -426,7 +426,7 @@ class PortfolioService:
         filename: str = "manual-reconcile",
         imported_at: dt.datetime | None = None,
     ) -> ReconciliationResult:
-        """Compare imported broker positions against Zopro's book and update
+        """Compare imported broker positions against Z Money's book and update
         the book to match. Does not write a `position_imports` row itself —
         `import_flex_csv` does that; call this directly only for a dry-run
         style reconciliation against an already-parsed row list."""

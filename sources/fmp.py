@@ -2,7 +2,7 @@
 insider. Cache hard; free tier is 250 calls/day."
 
 `FMPClient` is a thin, cached wrapper over the handful of Financial Modeling
-Prep endpoints Zopro needs. `FMPFactorSource` adapts it to the §8.2
+Prep endpoints Z Money needs. `FMPFactorSource` adapts it to the §8.2
 `FactorSource` interface so it plugs into the pipeline like any other source.
 
 **API generation: `/stable/`, not `/api/v3/`.** FMP retired the old

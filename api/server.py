@@ -14,13 +14,15 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.routes.briefing import router as briefing_router
+from api.routes.config import router as config_router
 from core.db import init_db, make_engine, make_session_factory
 
 ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = ROOT / "data" / "z_money.db"
+CONFIG_PATH = ROOT / "config.yaml"
 
 
-def create_app(db_path: str | Path = DB_PATH) -> FastAPI:
+def create_app(db_path: str | Path = DB_PATH, config_path: str | Path = CONFIG_PATH) -> FastAPI:
     app = FastAPI(title="Z Money API")
 
     app.add_middleware(
@@ -29,15 +31,17 @@ def create_app(db_path: str | Path = DB_PATH) -> FastAPI:
             "http://localhost:5173", "http://127.0.0.1:5173",  # Vite default
             "http://localhost:3000", "http://127.0.0.1:3000",  # common alternate
         ],
-        allow_methods=["GET"],
+        allow_methods=["GET", "POST"],
         allow_headers=["*"],
     )
 
     engine = make_engine(db_path)
     init_db(engine)
     app.state.session_factory = make_session_factory(engine)
+    app.state.config_path = Path(config_path)
 
     app.include_router(briefing_router, prefix="/api")
+    app.include_router(config_router, prefix="/api")
 
     @app.get("/api/health")
     def health() -> dict:

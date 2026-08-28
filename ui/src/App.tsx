@@ -1,8 +1,9 @@
 import { Route, HashRouter, Routes } from "react-router-dom";
-import { ChartPieSlice, ClockCounterClockwise, MagnifyingGlass } from "@phosphor-icons/react";
 import { Sidebar } from "./components/Sidebar";
 import { BriefingScreen } from "./routes/BriefingScreen";
-import { PlaceholderScreen } from "./routes/PlaceholderScreen";
+import { PositionsScreen } from "./routes/PositionsScreen";
+import { ResearchScreen } from "./routes/ResearchScreen";
+import { HistoryScreen } from "./routes/HistoryScreen";
 import { SettingsScreen } from "./routes/SettingsScreen";
 
 export default function App() {
@@ -13,18 +14,9 @@ export default function App() {
         <main className="min-w-0 flex-1">
           <Routes>
             <Route path="/" element={<BriefingScreen />} />
-            <Route
-              path="/positions"
-              element={<PlaceholderScreen title="Positions" icon={ChartPieSlice} />}
-            />
-            <Route
-              path="/research"
-              element={<PlaceholderScreen title="Research" icon={MagnifyingGlass} />}
-            />
-            <Route
-              path="/history"
-              element={<PlaceholderScreen title="History" icon={ClockCounterClockwise} />}
-            />
+            <Route path="/positions" element={<PositionsScreen />} />
+            <Route path="/research" element={<ResearchScreen />} />
+            <Route path="/history" element={<HistoryScreen />} />
             <Route path="/settings" element={<SettingsScreen />} />
           </Routes>
         </main>

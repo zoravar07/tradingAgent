@@ -7,35 +7,36 @@
  * not a light/dark toggle. Tokens live here as CSS variables so components
  * never hardcode a hex value.
  *
- * Palette: neutral zinc ground, one locked UI accent (signal blue) for
- * interactive/active state, and separate, non-negotiable financial
- * semantics (gain green / loss red / risk amber) — those aren't "the brand
- * accent", they're domain convention and must stay legible on their own.
+ * Palette: dark gray-blue ground (not pure black), one locked UI accent
+ * (signal blue) for interactive/active state, and separate, non-negotiable
+ * financial semantics (gain green / loss red / risk amber) — those aren't
+ * "the brand accent", they're domain convention and must stay legible on
+ * their own.
  */
 @theme {
   --font-sans: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", monospace;
 
-  --color-ground: #0a0a0d;
-  --color-panel: #131318;
-  --color-panel-raised: #1a1a21;
-  --color-hairline: #262631;
-  --color-hairline-strong: #34343f;
+  --color-ground: #0c1016;
+  --color-panel: #12171f;
+  --color-panel-raised: #1a212c;
+  --color-hairline: #232b38;
+  --color-hairline-strong: #303a4a;
 
-  --color-ink: #e8e8ee;
-  --color-ink-dim: #9d9daa;
-  --color-ink-faint: #64646f;
+  --color-ink: #e6e9ef;
+  --color-ink-dim: #98a1b3;
+  --color-ink-faint: #626d82;
 
-  --color-accent: #4f8bff;
-  --color-accent-dim: #2c4a8c;
-  --color-accent-wash: #16233d;
+  --color-accent: #5b8fe8;
+  --color-accent-dim: #35507e;
+  --color-accent-wash: #182437;
 
   --color-gain: #3fb67f;
-  --color-gain-wash: #12241b;
+  --color-gain-wash: #13241d;
   --color-loss: #e5594f;
-  --color-loss-wash: #2a1614;
+  --color-loss-wash: #2a1a1c;
   --color-risk: #d9a441;
-  --color-risk-wash: #2a2013;
+  --color-risk-wash: #2a2116;
 }
 
 html {

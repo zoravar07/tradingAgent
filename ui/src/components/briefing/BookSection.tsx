@@ -2,6 +2,7 @@ import { WarningOctagon } from "@phosphor-icons/react";
 import type { BookEntry } from "../../types/briefing";
 import { fmtPct, fmtUsd } from "../../lib/format";
 import { StatusPill } from "../StatusPill";
+import { HelpTip } from "../HelpTip";
 import { EmptySection, SectionShell } from "./SectionShell";
 
 function ConvictionCell({ entry }: { entry: BookEntry }) {
@@ -22,6 +23,16 @@ function ConvictionCell({ entry }: { entry: BookEntry }) {
       </span>
     );
   }
+  // Bug fix: conviction_at_entry used to be silently dropped here whenever
+  // conviction_now was null but an entry score still existed — the "was X"
+  // history disappeared even though the data was right there.
+  if (conviction_at_entry !== null) {
+    return (
+      <span className="num text-[var(--color-ink-faint)]">
+        — <span>(was {conviction_at_entry.toFixed(0)})</span>
+      </span>
+    );
+  }
   if (no_research_coverage) {
     return (
       <span className="inline-flex items-center gap-1 whitespace-nowrap text-[var(--color-risk)]">
@@ -37,9 +48,10 @@ function BookRow({ entry }: { entry: BookEntry }) {
   const pnlTone = entry.unrealized_pnl_pct >= 0 ? "text-[var(--color-gain)]" : "text-[var(--color-loss)]";
   const stopBreached =
     entry.distance_to_trailing_stop_pct !== null && entry.distance_to_trailing_stop_pct <= 0;
+  const needsAttention = stopBreached || entry.has_exit_trigger;
 
   return (
-    <tr className="border-b border-[var(--color-hairline)] last:border-0">
+    <tr className={`border-b border-[var(--color-hairline)] last:border-0 ${needsAttention ? "bg-[var(--color-loss-wash)]/40" : ""}`}>
       <td className="py-2.5 pr-4">
         <div className="flex items-center gap-2">
           <span className="num font-semibold text-[var(--color-ink)]">{entry.ticker}</span>
@@ -65,22 +77,37 @@ function BookRow({ entry }: { entry: BookEntry }) {
 
 export function BookSection({ book }: { book: BookEntry[] }) {
   return (
-    <SectionShell title="Your book" count={book.length}>
+    <SectionShell title="Your book" subtitle="Every position you're currently holding." count={book.length}>
       {book.length === 0 ? (
         <EmptySection label="No open positions." />
       ) : (
         <div className="overflow-x-auto">
-          <table className="w-full min-w-[720px] border-collapse text-sm">
+          <table className="w-full min-w-[760px] border-collapse text-sm">
             <thead>
               <tr className="border-b border-[var(--color-hairline-strong)] text-left text-xs text-[var(--color-ink-faint)]">
-                <th className="pb-2 pr-4 font-medium">Ticker</th>
-                <th className="pb-2 pr-4 font-medium">Qty</th>
-                <th className="pb-2 pr-4 font-medium">Value</th>
-                <th className="pb-2 pr-4 font-medium">Weight</th>
-                <th className="pb-2 pr-4 font-medium">P&amp;L</th>
-                <th className="pb-2 pr-4 font-medium">Conviction</th>
-                <th className="pb-2 pr-4 font-medium">To trailing stop</th>
-                <th className="pb-2 font-medium">Next profit band</th>
+                <th className="pb-2 pr-4 font-medium whitespace-nowrap">Ticker</th>
+                <th className="pb-2 pr-4 font-medium whitespace-nowrap">Qty</th>
+                <th className="pb-2 pr-4 font-medium whitespace-nowrap">Value</th>
+                <th className="pb-2 pr-4 font-medium whitespace-nowrap">Weight</th>
+                <th className="pb-2 pr-4 font-medium whitespace-nowrap">P&amp;L</th>
+                <th className="pb-2 pr-4 font-medium whitespace-nowrap">
+                  <span className="inline-flex items-center gap-1">
+                    Conviction
+                    <HelpTip text="Current confidence score (0–100), and what it was when the position was opened." />
+                  </span>
+                </th>
+                <th className="pb-2 pr-4 font-medium whitespace-nowrap">
+                  <span className="inline-flex items-center gap-1">
+                    To trailing stop
+                    <HelpTip text="How far the price can drop before the stop-loss sells it automatically. 0% or below means the stop already triggered." />
+                  </span>
+                </th>
+                <th className="pb-2 font-medium whitespace-nowrap">
+                  <span className="inline-flex items-center gap-1">
+                    Next profit band
+                    <HelpTip text="Distance to the next price level where the plan calls for trimming some profit." />
+                  </span>
+                </th>
               </tr>
             </thead>
             <tbody>

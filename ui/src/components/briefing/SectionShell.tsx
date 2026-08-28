@@ -1,21 +1,31 @@
 export function SectionShell({
   title,
+  subtitle,
   count,
+  accent,
   children,
 }: {
   title: string;
+  subtitle?: string;
   count?: number;
+  /** Stronger border/header treatment for the section that matters most on the page. */
+  accent?: boolean;
   children: React.ReactNode;
 }) {
   return (
-    <section className="rounded-xl border border-[var(--color-hairline)] bg-[var(--color-panel)]">
-      <header className="flex items-center gap-2 border-b border-[var(--color-hairline)] px-4 py-3">
-        <h2 className="text-[13px] font-semibold tracking-[0.02em] text-[var(--color-ink)]">
-          {title}
-        </h2>
-        {count !== undefined && (
-          <span className="text-[13px] text-[var(--color-ink-faint)]">{count}</span>
-        )}
+    <section
+      className={`rounded-xl border bg-[var(--color-panel)] ${
+        accent ? "border-[var(--color-accent)]/30" : "border-[var(--color-hairline)]"
+      }`}
+    >
+      <header
+        className={`flex flex-wrap items-baseline gap-x-2 gap-y-0.5 border-b px-4 py-3 ${
+          accent ? "border-[var(--color-accent)]/20" : "border-[var(--color-hairline)]"
+        }`}
+      >
+        <h2 className="text-[13px] font-semibold tracking-[0.02em] text-[var(--color-ink)]">{title}</h2>
+        {count !== undefined && <span className="text-[13px] text-[var(--color-ink-faint)]">{count}</span>}
+        {subtitle && <span className="w-full text-xs text-[var(--color-ink-faint)]">{subtitle}</span>}
       </header>
       <div className="p-4">{children}</div>
     </section>

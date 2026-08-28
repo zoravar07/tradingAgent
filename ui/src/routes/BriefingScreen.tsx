@@ -13,16 +13,21 @@ import { OvernightSection } from "../components/briefing/OvernightSection";
 import { BookSection } from "../components/briefing/BookSection";
 import { HealthSection } from "../components/briefing/HealthSection";
 import { BlockedBanner, DriftBanner, UnresearchedBanner } from "../components/briefing/Banners";
+import { SummaryStrip } from "../components/briefing/SummaryStrip";
 
 type LoadState =
   | { kind: "loading" }
   | { kind: "error"; message: string }
   | { kind: "loaded"; data: LatestBriefingResponse };
 
-function runStatusTone(status: string): "gain" | "loss" | "risk" | "neutral" {
+// Bug fix: "blocked" used to map to the amber "risk" tone here, while
+// BlockedBanner below renders the same state in red — same status, two
+// different colors on one screen. Blocked means nothing on the page is
+// trustworthy (see Banners.tsx), which is at least as severe as "failed",
+// so both get the same red treatment.
+function runStatusTone(status: string): "gain" | "loss" | "neutral" {
   if (status === "succeeded") return "gain";
-  if (status === "blocked") return "risk";
-  if (status === "failed") return "loss";
+  if (status === "blocked" || status === "failed") return "loss";
   return "neutral";
 }
 
@@ -91,6 +96,7 @@ function BriefingContent({ briefing }: { briefing: Briefing }) {
 
       {!briefing.blocked && (
         <>
+          <SummaryStrip briefing={briefing} />
           <ActionsSection actions={briefing.actions_today} />
           <div className="grid grid-cols-1 gap-5 md:grid-cols-2">
             <WatchingSection watching={briefing.watching} />

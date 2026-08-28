@@ -3,7 +3,11 @@ import { EmptySection, SectionShell } from "./SectionShell";
 
 export function WatchingSection({ watching }: { watching: WatchlistItem[] }) {
   return (
-    <SectionShell title="Watching" count={watching.length}>
+    <SectionShell
+      title="Watching"
+      subtitle="Getting close to a trigger. No action needed yet."
+      count={watching.length}
+    >
       {watching.length === 0 ? (
         <EmptySection label="Nothing on watch." />
       ) : (

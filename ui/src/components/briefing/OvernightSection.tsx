@@ -3,7 +3,11 @@ import { EmptySection, SectionShell } from "./SectionShell";
 
 export function OvernightSection({ changes }: { changes: OvernightChange[] }) {
   return (
-    <SectionShell title="Overnight changes" count={changes.length}>
+    <SectionShell
+      title="Overnight changes"
+      subtitle="News and moves on what you already own."
+      count={changes.length}
+    >
       {changes.length === 0 ? (
         <EmptySection label="Nothing material overnight." />
       ) : (

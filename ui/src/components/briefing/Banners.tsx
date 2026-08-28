@@ -43,8 +43,8 @@ export function UnresearchedBanner({ holdings }: { holdings: UnresearchedHolding
             No research coverage — {holdings.length} held position{holdings.length === 1 ? "" : "s"} unmonitored this run
           </p>
           <p className="mt-1 text-sm text-[var(--color-ink-dim)]">
-            No current conviction score: no thesis-decay trigger, no conviction-scaled stop or profit
-            thresholds. Treat as un-reviewed, not held-and-safe.
+            No fresh research on these — no decay warning, no smart stop or profit target. Treat them
+            as unreviewed, not safe.
           </p>
           <ul className="mt-3 flex flex-wrap gap-x-4 gap-y-1">
             {holdings.map((u) => (

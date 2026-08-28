@@ -1,9 +1,10 @@
 import { useState } from "react";
-import { CaretDown, Check, Copy } from "@phosphor-icons/react";
+import { CaretDown, Check, Copy, Lightning } from "@phosphor-icons/react";
 import type { ActionItem, OrderProposal } from "../../types/briefing";
 import { fmtUsd, fmtUsd2 } from "../../lib/format";
 import { StatusPill } from "../StatusPill";
-import { HelpTip } from "../HelpTip";
+import { ConvictionMeter } from "../ConvictionMeter";
+import { ClampText } from "../ClampText";
 import { EmptySection, SectionShell } from "./SectionShell";
 
 function CopyDetailsButton({ order }: { order: OrderProposal }) {
@@ -24,51 +25,52 @@ function CopyDetailsButton({ order }: { order: OrderProposal }) {
   return (
     <button
       onClick={handleCopy}
-      className="flex shrink-0 items-center gap-1 rounded-md border border-[var(--color-hairline-strong)] px-2 py-1 text-xs font-medium text-[var(--color-ink-dim)] transition-colors hover:bg-[var(--color-panel-raised)] hover:text-[var(--color-ink)] active:scale-[0.98]"
+      className="flex shrink-0 items-center gap-1.5 rounded-md border border-[var(--color-hairline-strong)] bg-[var(--color-panel)] px-2.5 py-1.5 text-xs font-medium text-[var(--color-ink-dim)] transition-colors hover:bg-[var(--color-panel-raised)] hover:text-[var(--color-ink)] active:scale-[0.98]"
     >
-      {copied ? <Check size={11} className="text-[var(--color-gain)]" /> : <Copy size={11} />}
+      {copied ? <Check size={12} className="text-[var(--color-gain)]" /> : <Copy size={12} />}
       {copied ? "Copied" : "Copy"}
     </button>
   );
 }
 
-function ActionRow({ item }: { item: ActionItem }) {
+function ActionCard({ item }: { item: ActionItem }) {
   const { order } = item;
-  const stripe = order.action === "BUY" ? "border-l-[var(--color-gain)]" : "border-l-[var(--color-loss)]";
+  const isBuy = order.action === "BUY";
+  const wash = isBuy
+    ? "bg-[var(--color-gain-wash)] border-[var(--color-gain)]/25"
+    : "bg-[var(--color-loss-wash)] border-[var(--color-loss)]/25";
 
   return (
-    <div
-      className={`border-b-[var(--color-hairline)] border-l-2 ${stripe} border-b py-3 pl-3 last:border-b-0 first:pt-0`}
-    >
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
-        <StatusPill tone={order.action === "BUY" ? "gain" : "loss"}>
-          {order.action}
-          {order.is_trim ? " · trim" : ""}
-        </StatusPill>
-        <span className="num text-sm font-semibold text-[var(--color-ink)]">{order.ticker}</span>
-        <span className="num text-sm text-[var(--color-ink-dim)]">
-          {order.quantity} sh @ {order.order_type} {fmtUsd2(order.limit_price)}
-        </span>
-        <span className="num text-sm text-[var(--color-ink-dim)]">
-          ~{fmtUsd(order.estimated_cost_usd)}
-        </span>
-        <span className="num text-sm text-[var(--color-ink-dim)]">{order.weight_pct.toFixed(1)}% of NAV</span>
-        <div className="ml-auto flex items-center gap-2.5">
-          <span className="num flex items-center gap-1 text-sm font-medium text-[var(--color-accent)]">
-            conviction {order.conviction.toFixed(0)}
-            <HelpTip text="A 0–100 confidence score from the research agent. Higher means stronger evidence for the thesis." />
-          </span>
-          <CopyDetailsButton order={order} />
+    <div className={`rounded-xl border p-4 ${wash}`}>
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <StatusPill tone={isBuy ? "gain" : "loss"}>
+            {order.action}
+            {order.is_trim ? " · trim" : ""}
+          </StatusPill>
+          <span className="num text-xl font-bold text-[var(--color-ink)]">{order.ticker}</span>
         </div>
+        <CopyDetailsButton order={order} />
       </div>
 
-      <p className="mt-1.5 text-sm text-[var(--color-ink)]">{item.headline}</p>
+      <p className="mt-2 text-[15px] font-semibold text-[var(--color-ink)]">{item.headline}</p>
       {item.thesis_summary && (
-        <p className="mt-0.5 text-sm text-[var(--color-ink-dim)]">{item.thesis_summary}</p>
+        <ClampText text={item.thesis_summary} lines={1} className="mt-1 text-sm text-[var(--color-ink-dim)]" />
       )}
 
+      <div className="mt-3 max-w-xs">
+        <ConvictionMeter score={order.conviction} size="sm" />
+      </div>
+
+      <div className="num mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-[var(--color-ink-faint)]">
+        <span>{order.quantity} sh</span>
+        <span>{order.order_type} {fmtUsd2(order.limit_price)}</span>
+        <span>~{fmtUsd(order.estimated_cost_usd)}</span>
+        <span>{order.weight_pct.toFixed(1)}% of NAV</span>
+      </div>
+
       {item.bear_case && (
-        <details className="group mt-1.5">
+        <details className="group mt-2.5 border-t border-[var(--color-hairline)] pt-2.5">
           <summary className="flex cursor-pointer list-none items-center gap-1 text-xs font-medium text-[var(--color-ink-faint)] hover:text-[var(--color-ink-dim)]">
             <CaretDown size={11} className="transition-transform group-open:rotate-180" />
             Bear case
@@ -87,11 +89,16 @@ export function ActionsSection({ actions }: { actions: ActionItem[] }) {
       subtitle="Trade-ready orders — copy the numbers into IBKR yourself."
       count={actions.length}
       accent={actions.length > 0}
+      icon={Lightning}
     >
       {actions.length === 0 ? (
         <EmptySection label="No proposals this run." />
       ) : (
-        actions.map((item, i) => <ActionRow key={`${item.order.ticker}-${i}`} item={item} />)
+        <div className="flex flex-col gap-3">
+          {actions.map((item, i) => (
+            <ActionCard key={`${item.order.ticker}-${i}`} item={item} />
+          ))}
+        </div>
       )}
     </SectionShell>
   );

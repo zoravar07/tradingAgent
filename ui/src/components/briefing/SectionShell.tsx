@@ -1,8 +1,11 @@
+import type { Icon } from "@phosphor-icons/react";
+
 export function SectionShell({
   title,
   subtitle,
   count,
   accent,
+  icon: TitleIcon,
   children,
 }: {
   title: string;
@@ -10,6 +13,7 @@ export function SectionShell({
   count?: number;
   /** Stronger border/header treatment for the section that matters most on the page. */
   accent?: boolean;
+  icon?: Icon;
   children: React.ReactNode;
 }) {
   return (
@@ -23,6 +27,7 @@ export function SectionShell({
           accent ? "border-[var(--color-accent)]/20" : "border-[var(--color-hairline)]"
         }`}
       >
+        {TitleIcon && <TitleIcon size={15} weight="bold" className="text-[var(--color-ink-faint)]" />}
         <h2 className="text-[13px] font-semibold tracking-[0.02em] text-[var(--color-ink)]">{title}</h2>
         {count !== undefined && <span className="text-[13px] text-[var(--color-ink-faint)]">{count}</span>}
         {subtitle && <span className="w-full text-xs text-[var(--color-ink-faint)]">{subtitle}</span>}

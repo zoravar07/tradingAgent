@@ -1,4 +1,4 @@
-import { WarningCircle } from "@phosphor-icons/react";
+import { ShieldCheck, WarningCircle } from "@phosphor-icons/react";
 import type { PortfolioHealth } from "../../types/briefing";
 import { HelpTip } from "../HelpTip";
 import { EmptySection, SectionShell } from "./SectionShell";
@@ -26,12 +26,22 @@ function SleeveBar({ name, actual, target }: { name: string; actual: number; tar
         )}
       </div>
       <span className="num w-14 shrink-0 text-right text-sm text-[var(--color-ink)]">{actual.toFixed(1)}%</span>
-      {/* Bug fix: target used to only be visible on hover (a title attr
-          nobody found) — it's the number that explains why a bar is
-          colored, so it needs to always be on screen. */}
       <span className="num w-20 shrink-0 text-right text-xs text-[var(--color-ink-faint)]">
         {target !== undefined ? `target ${target.toFixed(0)}%` : ""}
       </span>
+    </div>
+  );
+}
+
+function ClusterBar({ name, pct }: { name: string; pct: number }) {
+  const tone = pct >= 40 ? "bg-[var(--color-risk)]" : "bg-[var(--color-accent)]";
+  return (
+    <div className="flex items-center gap-3">
+      <span className="w-28 shrink-0 truncate text-sm text-[var(--color-ink-dim)]">{name}</span>
+      <div className="relative h-1.5 flex-1 rounded-full bg-[var(--color-hairline)]">
+        <div className={`absolute inset-y-0 left-0 rounded-full ${tone}`} style={{ width: `${Math.min(pct, 100)}%` }} />
+      </div>
+      <span className="num w-14 shrink-0 text-right text-sm text-[var(--color-ink)]">{pct.toFixed(1)}%</span>
     </div>
   );
 }
@@ -45,7 +55,7 @@ export function HealthSection({ health }: { health: PortfolioHealth }) {
   const hasContent = sleeveNames.length > 0 || clusterEntries.length > 0 || killTriggered;
 
   return (
-    <SectionShell title="Portfolio health" subtitle="How balanced and risky your holdings are right now.">
+    <SectionShell title="Portfolio health" subtitle="How balanced and risky your holdings are right now." icon={ShieldCheck}>
       {!hasContent && <EmptySection label="Nothing to review." />}
 
       {sleeveNames.length > 0 && (
@@ -66,16 +76,11 @@ export function HealthSection({ health }: { health: PortfolioHealth }) {
       )}
 
       {clusterEntries.length > 0 && (
-        <div className={`${sleeveNames.length > 0 ? "pt-4" : ""} ${killTriggered ? "border-b border-[var(--color-hairline)] pb-4" : ""}`}>
+        <div className={`flex flex-col gap-2.5 ${sleeveNames.length > 0 ? "pt-4" : ""} ${killTriggered ? "border-b border-[var(--color-hairline)] pb-4" : ""}`}>
           <p className="text-xs text-[var(--color-ink-faint)]">Correlated clusters</p>
-          <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1.5">
-            {clusterEntries.map(([name, pct]) => (
-              <span key={name} className="text-sm">
-                <span className="text-[var(--color-ink-dim)]">{name}</span>{" "}
-                <span className="num font-medium text-[var(--color-ink)]">{pct.toFixed(1)}%</span>
-              </span>
-            ))}
-          </div>
+          {clusterEntries.map(([name, pct]) => (
+            <ClusterBar key={name} name={name} pct={pct} />
+          ))}
         </div>
       )}
 

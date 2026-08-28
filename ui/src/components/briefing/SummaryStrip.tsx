@@ -1,3 +1,4 @@
+import { Lightning, ShieldCheck, ShieldWarning, TrendDown, Wallet } from "@phosphor-icons/react";
 import type { Briefing } from "../../types/briefing";
 import { fmtUsd } from "../../lib/format";
 import { StatTile } from "../StatTile";
@@ -15,21 +16,29 @@ export function SummaryStrip({ briefing }: { briefing: Briefing }) {
 
   return (
     <div className="flex shrink-0 flex-wrap items-stretch divide-x divide-[var(--color-hairline)] overflow-hidden rounded-xl border border-[var(--color-hairline)] bg-[var(--color-panel)]">
-      <StatTile label="Book value" value={fmtUsd(bookValue)} help="Sum of everything you currently hold — doesn't include cash." />
+      <StatTile
+        label="Book value"
+        value={fmtUsd(bookValue)}
+        icon={Wallet}
+        help="Sum of everything you currently hold — doesn't include cash."
+      />
       <StatTile
         label="Actions today"
         value={String(actionsCount)}
+        icon={Lightning}
         tone={actionsCount > 0 ? "accent" : undefined}
       />
-      <StatTile label="Cash" value={`${briefing.portfolio_health.cash_pct.toFixed(1)}%`} />
+      <StatTile label="Cash" value={`${briefing.portfolio_health.cash_pct.toFixed(1)}%`} icon={Wallet} />
       <StatTile
         label="Drawdown from peak"
         value={`${briefing.portfolio_health.drawdown_from_peak_pct.toFixed(1)}%`}
+        icon={TrendDown}
         tone={briefing.portfolio_health.drawdown_from_peak_pct > 0 ? "loss" : undefined}
       />
       <StatTile
         label="Kill switch"
         value={killTriggered ? "Triggered" : "OK"}
+        icon={killTriggered ? ShieldWarning : ShieldCheck}
         tone={killTriggered ? "loss" : "gain"}
         help="An automatic safety brake — when triggered, the system stops proposing new trades."
       />

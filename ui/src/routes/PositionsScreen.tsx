@@ -1,25 +1,53 @@
-import { FileArrowUp, PencilSimple, UploadSimple } from "@phosphor-icons/react";
+import { FileArrowUp, PencilSimple, UploadSimple, WarningCircle } from "@phosphor-icons/react";
 import { PreviewBanner } from "../components/PreviewBanner";
+import { StatusPill } from "../components/StatusPill";
+import { ConvictionMeter } from "../components/ConvictionMeter";
 import { SectionShell } from "../components/briefing/SectionShell";
-import { SAMPLE_POSITIONS } from "../lib/previewData";
+import { fmtPct, fmtUsd, fmtUsd2 } from "../lib/format";
+import { SAMPLE_POSITIONS, type SamplePosition } from "../lib/previewData";
 
 const IMPORT_STEPS = [
-  {
-    icon: UploadSimple,
-    title: "CSV import",
-    body: "Download a Flex Query CSV from IBKR Client Portal and drag it in. Works on IBKR Lite — do this weekly.",
-  },
-  {
-    icon: FileArrowUp,
-    title: "Mark as filled",
-    body: "When you place a proposed trade, click Filled and enter the price. Updates your book immediately.",
-  },
-  {
-    icon: PencilSimple,
-    title: "Manual entry",
-    body: "Add or edit a position by hand — the fallback, and how your first positions will get loaded.",
-  },
+  { icon: UploadSimple, title: "CSV import", body: "Drag in a Flex Query CSV from IBKR. Works on Lite — do this weekly." },
+  { icon: FileArrowUp, title: "Mark as filled", body: "Place a proposed trade, click Filled, enter the price." },
+  { icon: PencilSimple, title: "Manual entry", body: "Add or edit a position by hand — the fallback." },
 ] as const;
+
+function PositionCard({ p }: { p: SamplePosition }) {
+  const pnlPct = ((p.currentPrice - p.avgCost) / p.avgCost) * 100;
+  const isGain = pnlPct >= 0;
+
+  return (
+    <div className="flex flex-col gap-3 rounded-xl border border-[var(--color-hairline)] bg-[var(--color-panel)] p-4 transition-colors hover:border-[var(--color-hairline-strong)]">
+      <div className="flex items-start justify-between gap-2">
+        <div>
+          <span className="num text-lg font-bold text-[var(--color-ink)]">{p.ticker}</span>
+          <p className="num text-xs text-[var(--color-ink-faint)]">{p.qty} sh · avg {fmtUsd2(p.avgCost)}</p>
+        </div>
+        <StatusPill tone={isGain ? "gain" : "loss"}>{fmtPct(pnlPct)}</StatusPill>
+      </div>
+
+      <div>
+        <p className="num text-2xl font-semibold text-[var(--color-ink)]">{fmtUsd(p.qty * p.currentPrice)}</p>
+        <p className="num text-xs text-[var(--color-ink-faint)]">at {fmtUsd2(p.currentPrice)}/sh</p>
+      </div>
+
+      <ConvictionMeter score={p.convictionNow} size="sm" />
+
+      {p.alert && (
+        <div className="flex items-center gap-1.5 rounded-md bg-[var(--color-risk-wash)] px-2 py-1.5 text-xs font-medium text-[var(--color-risk)]">
+          <WarningCircle size={13} weight="fill" />
+          {p.alert}
+        </div>
+      )}
+
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-[var(--color-hairline)] pt-2.5 text-xs text-[var(--color-ink-faint)]">
+        <span>Opened {p.openedAt}</span>
+        <span>·</span>
+        <span>{p.source}</span>
+      </div>
+    </div>
+  );
+}
 
 export function PositionsScreen() {
   return (
@@ -30,9 +58,8 @@ export function PositionsScreen() {
 
       <div className="flex flex-1 flex-col gap-5 overflow-y-auto px-8 py-6">
         <PreviewBanner>
-          Positions tracking isn't live yet — the API only serves the nightly briefing so far. This is
-          what your book will look like once CSV imports and fills are wired up. Every row below is
-          sample data, not a real position.
+          Not live yet — this is a preview of what your book will look like. Every card below is sample
+          data.
         </PreviewBanner>
 
         <SectionShell title="How positions get in" subtitle="Three ways, in order of preference.">
@@ -52,42 +79,17 @@ export function PositionsScreen() {
           </div>
         </SectionShell>
 
-        <SectionShell
-          title="Your positions"
-          subtitle="Every held position, reconciled against your last CSV import."
-          count={SAMPLE_POSITIONS.length}
-        >
-          <div className="overflow-x-auto">
-            <table className="w-full min-w-[760px] border-collapse text-sm">
-              <thead>
-                <tr className="border-b border-[var(--color-hairline-strong)] text-left text-xs text-[var(--color-ink-faint)]">
-                  <th className="pb-2 pr-4 font-medium whitespace-nowrap">Ticker</th>
-                  <th className="pb-2 pr-4 font-medium whitespace-nowrap">Qty</th>
-                  <th className="pb-2 pr-4 font-medium whitespace-nowrap">Avg cost</th>
-                  <th className="pb-2 pr-4 font-medium whitespace-nowrap">Opened</th>
-                  <th className="pb-2 pr-4 font-medium whitespace-nowrap">Source</th>
-                  <th className="pb-2 pr-4 font-medium whitespace-nowrap">Last verified</th>
-                  <th className="pb-2 pr-4 font-medium whitespace-nowrap">Conviction @ entry</th>
-                  <th className="pb-2 font-medium whitespace-nowrap">Peak since entry</th>
-                </tr>
-              </thead>
-              <tbody>
-                {SAMPLE_POSITIONS.map((p) => (
-                  <tr key={p.ticker} className="border-b border-[var(--color-hairline)] last:border-0">
-                    <td className="num py-2.5 pr-4 font-semibold text-[var(--color-ink)]">{p.ticker}</td>
-                    <td className="num py-2.5 pr-4 text-[var(--color-ink-dim)]">{p.qty}</td>
-                    <td className="num py-2.5 pr-4 text-[var(--color-ink-dim)]">${p.avgCost.toFixed(2)}</td>
-                    <td className="py-2.5 pr-4 text-[var(--color-ink-dim)] whitespace-nowrap">{p.openedAt}</td>
-                    <td className="py-2.5 pr-4 whitespace-nowrap text-[var(--color-ink-faint)]">{p.source}</td>
-                    <td className="py-2.5 pr-4 text-[var(--color-ink-dim)] whitespace-nowrap">{p.lastVerifiedAt}</td>
-                    <td className="num py-2.5 pr-4 text-[var(--color-ink-dim)]">{p.convictionAtEntry}</td>
-                    <td className="num py-2.5 text-[var(--color-ink-dim)]">${p.peakSinceEntry.toFixed(2)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+        <div>
+          <div className="mb-3 flex items-baseline gap-2">
+            <h2 className="text-[13px] font-semibold tracking-[0.02em] text-[var(--color-ink)]">Your positions</h2>
+            <span className="text-[13px] text-[var(--color-ink-faint)]">{SAMPLE_POSITIONS.length}</span>
           </div>
-        </SectionShell>
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+            {SAMPLE_POSITIONS.map((p) => (
+              <PositionCard key={p.ticker} p={p} />
+            ))}
+          </div>
+        </div>
       </div>
     </div>
   );

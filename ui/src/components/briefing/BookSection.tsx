@@ -1,31 +1,26 @@
-import { WarningOctagon } from "@phosphor-icons/react";
+import { Wallet, WarningOctagon } from "@phosphor-icons/react";
 import type { BookEntry } from "../../types/briefing";
 import { fmtPct, fmtUsd } from "../../lib/format";
 import { StatusPill } from "../StatusPill";
 import { HelpTip } from "../HelpTip";
+import { ConvictionMeter } from "../ConvictionMeter";
 import { EmptySection, SectionShell } from "./SectionShell";
 
 function ConvictionCell({ entry }: { entry: BookEntry }) {
   const { conviction_now, conviction_at_entry, no_research_coverage } = entry;
 
-  if (conviction_now !== null && conviction_at_entry !== null) {
-    return (
-      <span className="num text-[var(--color-ink)]">
-        {conviction_now.toFixed(0)}{" "}
-        <span className="text-[var(--color-ink-faint)]">(was {conviction_at_entry.toFixed(0)})</span>
-      </span>
-    );
-  }
   if (conviction_now !== null) {
     return (
-      <span className="num text-[var(--color-ink)]">
-        {conviction_now.toFixed(0)} <span className="text-[var(--color-ink-faint)]">(no baseline)</span>
-      </span>
+      <div className="flex max-w-[9.5rem] items-center gap-2">
+        <ConvictionMeter score={conviction_now} size="sm" label={null} />
+        {conviction_at_entry !== null && (
+          <span className="num shrink-0 text-xs text-[var(--color-ink-faint)]">was {conviction_at_entry.toFixed(0)}</span>
+        )}
+      </div>
     );
   }
-  // Bug fix: conviction_at_entry used to be silently dropped here whenever
-  // conviction_now was null but an entry score still existed — the "was X"
-  // history disappeared even though the data was right there.
+  // Bug fix (kept from prior pass): conviction_at_entry used to be silently
+  // dropped whenever conviction_now was null but an entry score existed.
   if (conviction_at_entry !== null) {
     return (
       <span className="num text-[var(--color-ink-faint)]">
@@ -77,7 +72,7 @@ function BookRow({ entry }: { entry: BookEntry }) {
 
 export function BookSection({ book }: { book: BookEntry[] }) {
   return (
-    <SectionShell title="Your book" subtitle="Every position you're currently holding." count={book.length}>
+    <SectionShell title="Your book" subtitle="Every position you're currently holding." count={book.length} icon={Wallet}>
       {book.length === 0 ? (
         <EmptySection label="No open positions." />
       ) : (

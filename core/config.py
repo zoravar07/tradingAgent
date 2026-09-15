@@ -207,6 +207,14 @@ class SleeveConfig(BaseModel):
     # SPECULATIVE only: crossing this NAV weight reclassifies the position to
     # SWING (Part 4 wires the trigger — this field just carries the number).
     reclass_at_pct: float | None = None
+    # SPECULATIVE only: a position whose weight exceeds slot_pct times this
+    # multiple gets flagged OVERSIZED_SPECULATIVE (advisory, never a forced
+    # trim) — it carries SPECULATIVE's exit rules (hard stop only) but
+    # wasn't sized under the 2.5%-slot discipline (e.g. a pre-existing
+    # position assigned to this sleeve rather than sized into it). 2.0 is a
+    # guess, not measured — revisit once there's a real distribution of
+    # SPECULATIVE position sizes to look at.
+    oversized_slot_multiple: float | None = None
 
 
 class SleevesConfig(BaseModel):
@@ -221,7 +229,7 @@ class SleevesConfig(BaseModel):
         "SWING": SleeveConfig(target_pct=30, band_low_pct=15, band_high_pct=40, tickers=[]),
         "SPECULATIVE": SleeveConfig(
             target_pct=7, band_low_pct=0, band_high_pct=12, tickers=["RKLB", "SOFI"],
-            slot_count=5, slot_pct=2.5, hard_stop_pct=-60, reclass_at_pct=15,
+            slot_count=5, slot_pct=2.5, hard_stop_pct=-60, reclass_at_pct=15, oversized_slot_multiple=2.0,
         ),
     }
 

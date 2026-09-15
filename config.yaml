@@ -160,7 +160,7 @@ sleeves:
     CORE:        { target_pct: 50, band_low_pct: 40, band_high_pct: 65, tickers: [VTI, VGT] }
     HEDGE_CASH:  { target_pct: 13, band_low_pct: 8,  band_high_pct: 25, tickers: [IAU], includes_account_cash: true }
     SWING:       { target_pct: 30, band_low_pct: 15, band_high_pct: 40, tickers: [] }
-    SPECULATIVE: { target_pct: 7,  band_low_pct: 0,  band_high_pct: 12, tickers: [RKLB, SOFI], slot_count: 5, slot_pct: 2.5, hard_stop_pct: -60, reclass_at_pct: 15 }
+    SPECULATIVE: { target_pct: 7,  band_low_pct: 0,  band_high_pct: 12, tickers: [RKLB, SOFI], slot_count: 5, slot_pct: 2.5, hard_stop_pct: -60, reclass_at_pct: 15, oversized_slot_multiple: 2.0 }
 
 # Informational-only "this smells speculative" warning on a new SWING BUY —
 # never blocks, never reclassifies. market_cap_below_usd is a guess, not

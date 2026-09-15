@@ -107,6 +107,20 @@ def speculative_look_reasons(
     return reasons
 
 
+def oversized_speculative(weight_pct: float, sleeve_config: SleeveConfig) -> bool:
+    """SPECULATIVE positions are meant to be sized in fixed slot_pct
+    tranches (2.5% NAV each), never averaged, never grown by conviction.
+    A position that's materially larger than one slot — RKLB's real
+    scenario: assigned to SPECULATIVE rather than sized into it, since it
+    predates the sleeve rule — still gets SPECULATIVE's exit rules (hard
+    stop only, no trailing stop/profit band/conviction floor) even though
+    it wasn't sized under that discipline. Advisory flag only; never forces
+    a trim."""
+    if sleeve_config.slot_pct is None or sleeve_config.oversized_slot_multiple is None:
+        return False
+    return weight_pct > sleeve_config.slot_pct * sleeve_config.oversized_slot_multiple
+
+
 def averaging_down_blocked(current_price: float, avg_cost: float) -> bool:
     """SPECULATIVE: "never averaged down" — a BUY that would add to an
     already-held SPECULATIVE position at a price below its cost basis is

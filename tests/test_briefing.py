@@ -283,3 +283,28 @@ class TestSleeveBandBreachesOnPortfolioHealth:
         advisory = SleeveBreachAdvisory(sleeve="SWING", direction="OVER", weight_pct=47.0, streak_days=11)
         health = PortfolioHealth(sleeve_band_breaches=[advisory])
         assert health.sleeve_band_breaches[0].sleeve == "SWING"
+
+
+class TestOversizedSpeculativeOnBookEntry:
+    def test_defaults_to_false(self):
+        entry = book_entry(ticker="RKLB")
+        assert entry.oversized_speculative is False
+
+    def test_renders_a_warning_flag(self):
+        entry = BookEntry(
+            ticker="RKLB", qty=3, value_usd=200.0, weight_pct=8.0, unrealized_pnl_pct=-47.0,
+            oversized_speculative=True,
+        )
+        briefing = assemble_briefing(
+            generated_at=NOW, actions_today=[], watching=[], overnight_changes=[], book=[entry],
+            portfolio_health=PortfolioHealth(),
+        )
+        assert "OVERSIZED_SPECULATIVE" in render_briefing_text(briefing)
+
+    def test_no_flag_when_not_oversized(self):
+        entry = book_entry(ticker="RKLB")
+        briefing = assemble_briefing(
+            generated_at=NOW, actions_today=[], watching=[], overnight_changes=[], book=[entry],
+            portfolio_health=PortfolioHealth(),
+        )
+        assert "OVERSIZED_SPECULATIVE" not in render_briefing_text(briefing)

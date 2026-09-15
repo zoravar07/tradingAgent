@@ -4,6 +4,7 @@ from core.sleeves import (
     SleeveDrift,
     averaging_down_blocked,
     find_sleeve_drift,
+    oversized_speculative,
     resolve_sleeve,
     sleeve_room,
     speculative_look_reasons,
@@ -151,3 +152,34 @@ class TestAveragingDownBlocked:
 
     def test_allows_at_exactly_avg_cost(self):
         assert averaging_down_blocked(current_price=15.0, avg_cost=15.0) is False
+
+
+SPECULATIVE = SleeveConfig(
+    target_pct=7, band_low_pct=0, band_high_pct=12, tickers=["RKLB", "SOFI"],
+    slot_count=5, slot_pct=2.5, hard_stop_pct=-60, reclass_at_pct=15, oversized_slot_multiple=2.0,
+)
+
+
+class TestOversizedSpeculative:
+    def test_flags_position_well_above_slot_size(self):
+        # RKLB's real scenario: sized under old conviction-based rules,
+        # assigned to SPECULATIVE rather than sized into it (slot=2.5%,
+        # threshold at 2x = 5%)
+        assert oversized_speculative(weight_pct=8.0, sleeve_config=SPECULATIVE) is True
+
+    def test_does_not_flag_a_position_sized_at_one_slot(self):
+        assert oversized_speculative(weight_pct=2.5, sleeve_config=SPECULATIVE) is False
+
+    def test_does_not_flag_exactly_at_threshold(self):
+        assert oversized_speculative(weight_pct=5.0, sleeve_config=SPECULATIVE) is False
+
+    def test_flags_just_above_threshold(self):
+        assert oversized_speculative(weight_pct=5.01, sleeve_config=SPECULATIVE) is True
+
+    def test_no_multiple_configured_never_flags(self):
+        no_multiple = SleeveConfig(target_pct=7, band_low_pct=0, band_high_pct=12, slot_pct=2.5)
+        assert oversized_speculative(weight_pct=100.0, sleeve_config=no_multiple) is False
+
+    def test_no_slot_pct_configured_never_flags(self):
+        no_slot = SleeveConfig(target_pct=30, band_low_pct=15, band_high_pct=40)
+        assert oversized_speculative(weight_pct=100.0, sleeve_config=no_slot) is False

@@ -88,6 +88,7 @@ from core.risk_rules import (
 from core.scoring import compute_conviction
 from core.sleeves import (
     SleeveBreachStatus,
+    oversized_speculative,
     resolve_sleeve,
     sleeve_room,
     speculative_look_reasons,
@@ -566,6 +567,24 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row, new
         weight_pct = (value_usd / nav.amount * 100) if nav.amount else 0.0
         unrealized_pnl_pct = ((current_price - pos.avg_cost) / pos.avg_cost * 100) if pos.avg_cost else 0.0
 
+        # Advisory only, never a forced trim (user-requested): a SPECULATIVE
+        # position sized well above one slot — assigned to the sleeve
+        # rather than sized into it — still carries SPECULATIVE's exit
+        # rules (hard stop only) even though it wasn't sized under that
+        # discipline.
+        is_oversized_speculative = False
+        if pos.sleeve == "SPECULATIVE":
+            speculative_defn = config.sleeves.definitions.get("SPECULATIVE")
+            if speculative_defn is not None:
+                is_oversized_speculative = oversized_speculative(weight_pct, speculative_defn)
+                if is_oversized_speculative:
+                    session.add(RiskEvent(
+                        run_id=run_row.id, type="OVERSIZED_SPECULATIVE",
+                        detail_json=json.dumps({
+                            "ticker": pos.ticker, "weight_pct": weight_pct, "slot_pct": speculative_defn.slot_pct,
+                        }),
+                    ))
+
         if evaluation.has_exit_signal:
             order = build_exit_order(
                 pos.ticker, pos.qty, current_price, weight_pct, conviction_now, evaluation, config.order_builder
@@ -606,6 +625,7 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row, new
                 distance_to_trailing_stop_pct=_distance_to_stop_pct(evaluation, current_price),
                 has_exit_trigger=evaluation.has_exit_signal,
                 no_research_coverage=conviction_now is None,
+                oversized_speculative=is_oversized_speculative,
             )
         )
     session.flush()

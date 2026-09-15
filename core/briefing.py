@@ -80,6 +80,12 @@ class BookEntry:
     # and how old. Never set alongside a fresh score.
     conviction_run_id: int | None = None
     conviction_age_days: float | None = None  # fractional; rendered as hours under a day
+    # User-requested advisory (core.sleeves.oversized_speculative): a
+    # SPECULATIVE position sized well above one 2.5%-NAV slot — it carries
+    # SPECULATIVE's exit rules (hard stop only) but wasn't sized under
+    # speculative discipline (e.g. assigned to the sleeve rather than sized
+    # into it). Never forces a trim; surfaced on the Positions page and here.
+    oversized_speculative: bool = False
 
 
 @dataclass
@@ -301,6 +307,8 @@ def render_briefing_text(briefing: Briefing) -> str:
         else:
             conv = "conviction n/a"
         flag = "  ⚠ EXIT TRIGGERED" if b.has_exit_trigger else ""
+        if b.oversized_speculative:
+            flag += "  ⚠ OVERSIZED_SPECULATIVE (carries speculative exit rules, not sized under speculative discipline)"
         lines.append(
             f"{b.ticker:<6} qty={b.qty:g}  value=${b.value_usd:,.0f}  weight={b.weight_pct:.1f}%  "
             f"pnl={b.unrealized_pnl_pct:+.1f}%  {conv}{flag}"

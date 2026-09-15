@@ -25,7 +25,7 @@ from core.config import (
     ResearchConfig,
 )
 from core.llm import LLMClient, MonthlySpendTracker
-from core.models import Candidate, Conviction, NavSnapshot, Proposal, ResearchOutput, Run
+from core.models import Candidate, Conviction, NavSnapshot, Proposal, ResearchOutput, RiskEvent, Run
 from core.money import usd
 from core.config import UniverseConfig, WeeklyWideScanConfig
 from core.orchestrator import NightlyRunInputs, build_universe, resolve_universe, rotating_slice, run_nightly
@@ -268,6 +268,43 @@ class TestSleeveWiring:
         assert briefing.portfolio_health.sleeve_targets_pct["CORE"] == 50
         # VTI 10*$400=$4,000 of $7,000 NAV = ~57.1%
         assert briefing.portfolio_health.sleeve_weights_pct["CORE"] == pytest.approx(57.14, abs=0.1)
+
+    def test_oversized_speculative_position_is_flagged(self, session, portfolio, tmp_path):
+        # RKLB's real scenario: sized under old conviction-based rules
+        # (well above one 2.5%-NAV slot), assigned to SPECULATIVE rather
+        # than sized into it, and down sharply — still no exit until the
+        # hard stop, so this advisory is the only signal it gets.
+        portfolio.add_manual_position("RKLB", qty=10, avg_cost=100.0, opened_at=dt.datetime(2026, 7, 1))
+        inputs_by_ticker = {"RKLB": screener_input("RKLB", is_held=True, technical=technical(atr_14=1.0))}
+        gateway = FakeGateway(inputs=inputs_by_ticker, prices={"RKLB": 53.0})  # -47% from cost, value=$530
+        script = [FakeResponse(parsed_output=memo(subscore=36.0))]
+        llm = make_llm(tmp_path, script)
+        config = make_config()
+        run_inputs = NightlyRunInputs(
+            as_of=dt.datetime(2026, 9, 1), universe_tickers=["RKLB"], held_tickers=["RKLB"], cash=usd(5_470.0)
+        )
+        briefing = run_nightly(session=session, portfolio=portfolio, gateway=gateway, llm=llm, config=config, inputs=run_inputs)
+        rklb_entry = next(b for b in briefing.book if b.ticker == "RKLB")
+        assert rklb_entry.weight_pct == pytest.approx(8.83, abs=0.1)  # well above the 5% (2x 2.5% slot) threshold
+        assert rklb_entry.oversized_speculative is True
+        assert rklb_entry.has_exit_trigger is False  # advisory only, no forced trade
+
+        risk_events = session.execute(select(RiskEvent).where(RiskEvent.type == "OVERSIZED_SPECULATIVE")).scalars().all()
+        assert len(risk_events) == 1
+
+    def test_speculative_position_sized_at_one_slot_is_not_flagged(self, session, portfolio, tmp_path):
+        portfolio.add_manual_position("RKLB", qty=1, avg_cost=100.0, opened_at=dt.datetime(2026, 7, 1))
+        inputs_by_ticker = {"RKLB": screener_input("RKLB", is_held=True, technical=technical(atr_14=1.0))}
+        gateway = FakeGateway(inputs=inputs_by_ticker, prices={"RKLB": 100.0})  # $100 of a $4,000 NAV = 2.5%
+        script = [FakeResponse(parsed_output=memo(subscore=50.0))]
+        llm = make_llm(tmp_path, script)
+        config = make_config()
+        run_inputs = NightlyRunInputs(
+            as_of=dt.datetime(2026, 9, 1), universe_tickers=["RKLB"], held_tickers=["RKLB"], cash=usd(3_900.0)
+        )
+        briefing = run_nightly(session=session, portfolio=portfolio, gateway=gateway, llm=llm, config=config, inputs=run_inputs)
+        rklb_entry = next(b for b in briefing.book if b.ticker == "RKLB")
+        assert rklb_entry.oversized_speculative is False
 
 
 class TestFullNightlyRun:

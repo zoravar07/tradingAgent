@@ -1,7 +1,6 @@
 version: 1
 
 portfolio:
-  import_reminder_days: 7        # warn if positions haven't been verified recently
   # Governs manual entry / mark-filled recording only — NOT Order Builder's
   # output, which always produces whole-share BUY/exit quantities via
   # floor()/int() math regardless of this flag (agents/order_builder.py).
@@ -16,12 +15,24 @@ schedule:
 universe:
   include_holdings_always: true
   watchlist: [AMD, NVDA, MRVL, CRDO, NBIS, VRT, CLS, CEG, MP, PLTR, RKLB, SOFI, MSFT]
-  # Day-to-day universe = holdings + watchlist + a rotating slice of this
-  # pool, so the FMP call budget (250/day free tier) is never at risk.
-  # The full pool still gets covered over time — at 30/day it takes about
-  # 17 days to rotate through all ~500 S&P 500 names once.
-  rotating_pool_source: SP500
-  rotating_scan_size: 30
+  # Day-to-day universe = holdings + watchlist + extra_tickers + the scan
+  # pool. Pool membership is the S&P 500 list parsed from Wikipedia
+  # (sources/index_constituents.py) — FMP's constituents endpoint is
+  # 402-gated on this plan, which is why every run before run 6 screened
+  # only the names already held.
+  # SP500 = Wikipedia's index list. US_ALL = every NASDAQ/NYSE/AMEX/Arca/Cboe
+  # common stock (NASDAQ Trader symbol directory, ~5,000), pre-gated on the
+  # stage1 liquidity/market-cap floors from yfinance screener data before
+  # any per-name fetch (~1,900 pass) — sources/us_listing.py.
+  rotating_pool_source: US_ALL
+  # 0 = scan the whole pool every day. Stage 1 runs on yfinance only (zero
+  # FMP calls), so this no longer threatens the 250/day FMP cap; FMP budget
+  # is spent only on names that reach Research. Set to e.g. 30 to go back to
+  # a rotating slice if yfinance rate-limits a full daily scan.
+  rotating_scan_size: 0
+  # Names outside the index to screen every day (not rotated). Empty by
+  # default — add small caps or foreign listings yfinance can price.
+  extra_tickers: []
   weekly_wide_scan:
     enabled: false                 # flip on if you upgrade past the FMP free tier
     day_of_week: 6                 # 0=Mon..6=Sun (Python weekday numbering) — Sunday by default
@@ -60,12 +71,27 @@ screener:
     earnings_proximity_days: 5       # flag if earnings are within this many days
   stage2:
     model: claude-haiku-4-5
-    lookback_days: 7
     max_survivors: 15
+    # One structured Haiku call per batch over cached Stage 1 numbers — no
+    # web search. Stage 2 prioritises; the research digest does the
+    # fact-finding, only for names that get a memo.
+    batch_size: 40
 
 research:
   model: claude-sonnet-4-6
-  max_candidates_per_run: 15
+  max_candidates_per_run: 10          # hard cap on NEW names memo'd per run (15 -> 10 on 2026-09-10 to hold a run under $0.75)
+  # Grounded news: one web-search call per memo'd name, on the cheap model,
+  # one targeted search, cached 48h. Never falls back to model memory when
+  # off — the section is simply empty. See agents/research.py.
+  web_search_enabled: true
+  web_search_max_uses: 1
+  digest_model: claude-haiku-4-5
+  news_lookback_days: 7
+  news_cache_hours: 48
+  # Held positions: ceil(held / 7) get a fresh memo each run, oldest first,
+  # so the book cycles weekly at a flat daily cost. In between, the last
+  # real score is reused and shown with its age.
+  holdings_refresh_days: 7
 
 order_builder:
   # §5.4 names the job ("limit price from recent price action and spread")
@@ -126,6 +152,22 @@ conviction_scaling:
   trailing_stop_atr_multiple: { at_0: 1.5, at_100: 4.5 }
   profit_taking_start_pct:    { at_0: 15,  at_100: 60 }
 
+sleeves:
+  default_sleeve: SWING
+  breach_sustain_days: 10
+  breach_margin_pct: 5.0
+  definitions:
+    CORE:        { target_pct: 50, band_low_pct: 40, band_high_pct: 65, tickers: [VTI, VGT] }
+    HEDGE_CASH:  { target_pct: 13, band_low_pct: 8,  band_high_pct: 25, tickers: [IAU], includes_account_cash: true }
+    SWING:       { target_pct: 30, band_low_pct: 15, band_high_pct: 40, tickers: [] }
+    SPECULATIVE: { target_pct: 7,  band_low_pct: 0,  band_high_pct: 12, tickers: [RKLB, SOFI], slot_count: 5, slot_pct: 2.5, hard_stop_pct: -60, reclass_at_pct: 15 }
+
+# Informational-only "this smells speculative" warning on a new SWING BUY —
+# never blocks, never reclassifies. market_cap_below_usd is a guess, not
+# measured against RKLB/SOFI's actual entry caps (see core/config.py).
+speculative_look:
+  market_cap_below_usd: 10000000000
+
 sources:
   fmp:             { enabled: true }
   prices:          { enabled: true }
@@ -134,5 +176,10 @@ sources:
 options:
   enabled: false                    # only after the equity loop is proven
 
+briefing:
+  watching_max_items: 12            # "Watching" shows the N near-misses closest to their trigger
 budget:
-  monthly_api_cap_usd: 40           # halts LLM calls if exceeded
+  # Raised 40 -> 80 (2026-09-09) to cover grounded web search in Stage 2 and
+  # Research at the full ~512-name universe: ~$0.01/search on top of tokens.
+  monthly_api_cap_usd: 80           # halts LLM calls if exceeded
+  max_run_cost_usd: 0.75            # pre-flight: a run projected above this refuses to start

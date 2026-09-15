@@ -16,7 +16,6 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class PortfolioConfig(BaseModel):
-    import_reminder_days: int = 7
     # Default is conservative (whole shares only) for a fresh config; governs
     # manual entry / mark-filled recording only, not Order Builder's output
     # (always whole-share by construction, see agents/order_builder.py) —
@@ -36,8 +35,20 @@ class WeeklyWideScanConfig(BaseModel):
 class UniverseConfig(BaseModel):
     include_holdings_always: bool = True
     watchlist: list[str] = []
+    # "SP500": Wikipedia's index list (sources/index_constituents.py).
+    # "US_ALL": every NASDAQ/NYSE/AMEX/Arca/Cboe common stock from NASDAQ
+    # Trader's symbol directory, pre-gated on Stage 1's liquidity and
+    # market-cap floors from yfinance screener data before any per-name
+    # fetch (sources/us_listing.py) — ~5,000 listed, ~1,900 pass.
     rotating_pool_source: str = "SP500"
-    rotating_scan_size: int = 30
+    # 0 = scan the whole pool every day. Stage 1 runs on yfinance only (no FMP
+    # calls), so a full-pool daily scan costs nothing against the FMP cap —
+    # see sources/live_gateway.py. A positive value restores the rotating
+    # slice (that many pool names per day).
+    rotating_scan_size: int = 0
+    # Names outside the index you want screened every day regardless of
+    # rotation — e.g. small caps FMP/Wikipedia will never list.
+    extra_tickers: list[str] = []
     weekly_wide_scan: WeeklyWideScanConfig = WeeklyWideScanConfig()
     # §9's note names these 10 tickers as "your AI/semis cluster" explicitly —
     # copied here as the seed override map, not invented.
@@ -66,8 +77,10 @@ class Stage1Config(BaseModel):
 
 class Stage2Config(BaseModel):
     model: str = "claude-haiku-4-5"
-    lookback_days: int = 7
     max_survivors: int = 15
+    # Candidates per structured ranking call. Stage 2 is one Haiku call per
+    # chunk over cached Stage 1 numbers — no web search (agents/screener.py).
+    batch_size: int = 40
 
 
 class ScreenerConfig(BaseModel):
@@ -122,7 +135,26 @@ class RiskConfig(BaseModel):
 
 class ResearchConfig(BaseModel):
     model: str = "claude-sonnet-4-6"
+    # Hard cap on NEW (non-held) names that get a memo per run.
     max_candidates_per_run: int = 15
+    # Grounded news: one web-search text call per researched name feeds the
+    # memo and the briefing's "Overnight changes". Never falls back to model
+    # memory when off — the section is simply empty. Digests are a
+    # fact-listing task, so they run on the cheaper model by default; each
+    # search is $0.01 on top of tokens (core/llm.py).
+    web_search_enabled: bool = True
+    web_search_max_uses: int = 1
+    digest_model: str = "claude-haiku-4-5"
+    news_lookback_days: int = 7
+    # A digest is reused within this window instead of re-searching the
+    # same name every night.
+    news_cache_hours: int = 48
+    # Held positions are re-researched on a rolling cadence: each run
+    # refreshes the ceil(held / this) names with the oldest memo, so every
+    # holding gets a fresh memo about this often. Between refreshes the
+    # last real conviction score is reused and flagged with its age —
+    # never a made-up number.
+    holdings_refresh_days: int = 7
 
 
 class OrderBuilderConfig(BaseModel):
@@ -139,8 +171,71 @@ class ScheduleConfig(BaseModel):
     nightly_run: str = "0 22 * * 0-4"
 
 
+class BriefingConfig(BaseModel):
+    # Cap on the "Watching" section. At a ~1,800-name universe Stage 1
+    # produces ~80 near-misses; the closest to firing (smallest distance to
+    # trigger) are kept, the rest are dropped from the briefing and the
+    # watchlist_items table alike.
+    watching_max_items: int = 12
+
+
 class BudgetConfig(BaseModel):
     monthly_api_cap_usd: float = 40
+    # Pre-flight guard (scripts/run_live_briefing.py): a run whose projected
+    # LLM cost exceeds this refuses to start.
+    max_run_cost_usd: float = 0.75
+
+
+class SleeveConfig(BaseModel):
+    """One sleeve's target/band and, for the three closed-list sleeves, its
+    membership and special sizing/exit rules. `tickers=[]` (SWING) means
+    "no explicit list" — resolve_sleeve() falls back to default_sleeve for
+    anything not claimed by CORE/HEDGE_CASH/SPECULATIVE."""
+
+    target_pct: float
+    band_low_pct: float
+    band_high_pct: float
+    tickers: list[str] = []
+    # HEDGE_CASH only: sleeve weight adds inputs.cash on top of ticker holdings.
+    includes_account_cash: bool = False
+    # SPECULATIVE only: sized by slots, not conviction — max concurrent
+    # positions and a fixed % of NAV per slot.
+    slot_count: int | None = None
+    slot_pct: float | None = None
+    # SPECULATIVE only: exits at this % from avg_cost (e.g. -60), no trailing stop.
+    hard_stop_pct: float | None = None
+    # SPECULATIVE only: crossing this NAV weight reclassifies the position to
+    # SWING (Part 4 wires the trigger — this field just carries the number).
+    reclass_at_pct: float | None = None
+
+
+class SleevesConfig(BaseModel):
+    default_sleeve: str = "SWING"
+    breach_sustain_days: int = 10
+    breach_margin_pct: float = 5.0
+    definitions: dict[str, SleeveConfig] = {
+        "CORE": SleeveConfig(target_pct=50, band_low_pct=40, band_high_pct=65, tickers=["VTI", "VGT"]),
+        "HEDGE_CASH": SleeveConfig(
+            target_pct=13, band_low_pct=8, band_high_pct=25, tickers=["IAU"], includes_account_cash=True
+        ),
+        "SWING": SleeveConfig(target_pct=30, band_low_pct=15, band_high_pct=40, tickers=[]),
+        "SPECULATIVE": SleeveConfig(
+            target_pct=7, band_low_pct=0, band_high_pct=12, tickers=["RKLB", "SOFI"],
+            slot_count=5, slot_pct=2.5, hard_stop_pct=-60, reclass_at_pct=15,
+        ),
+    }
+
+
+class SpeculativeLookConfig(BaseModel):
+    """Thresholds for the informational 'this smells speculative' warning on
+    a new BUY that defaulted to SWING (core/sleeves.py's
+    speculative_look_reasons). Never blocks, never reclassifies — purely
+    advisory, per explicit user request. market_cap_below_usd is a
+    conservative guess, not measured against RKLB/SOFI's actual entry caps —
+    revisit once there's evidence of what predicts that cohort, same
+    reasoning as risk_rules.py's thesis_decay_trigger_pts."""
+
+    market_cap_below_usd: float = 10_000_000_000
 
 
 class Config(BaseModel):
@@ -159,6 +254,9 @@ class Config(BaseModel):
     order_builder: OrderBuilderConfig = OrderBuilderConfig()
     schedule: ScheduleConfig = ScheduleConfig()
     budget: BudgetConfig = BudgetConfig()
+    briefing: BriefingConfig = BriefingConfig()
+    sleeves: SleevesConfig = SleevesConfig()
+    speculative_look: SpeculativeLookConfig = SpeculativeLookConfig()
 
 
 def load_config(path: str | Path) -> Config:

@@ -11,6 +11,7 @@ from core.risk_rules import (
     lerp_by_conviction,
     meets_entry_floor,
     profit_band_crossed,
+    runner_trim_triggered,
     size_new_position,
     size_speculative_position,
     thesis_decay_triggered,
@@ -362,6 +363,20 @@ class TestUpdatePeakPrice:
         assert not any(t.type == "TRAILING_STOP" for t in evaluation.triggers)
 
 
+class TestRunnerTrimTriggered:
+    def test_breaches_above_trigger_pct(self):
+        breached, detail = runner_trim_triggered(weight_pct=31.0, config=RISK)
+        assert breached is True
+        assert detail["trigger_pct"] == 30.0
+        assert detail["target_pct"] == 25.0
+
+    def test_does_not_breach_at_or_below_trigger_pct(self):
+        breached, _ = runner_trim_triggered(weight_pct=30.0, config=RISK)
+        assert breached is False
+        breached, _ = runner_trim_triggered(weight_pct=12.0, config=RISK)
+        assert breached is False
+
+
 class TestHardStopBreached:
     def test_breaches_at_or_below_threshold(self):
         breached, detail = hard_stop_breached(current_price=40.0, avg_cost=100.0, hard_stop_pct=-60)
@@ -424,6 +439,77 @@ class TestEvaluateHeldPositionSleeveGating:
         )
         assert evaluation.has_exit_signal is True
         assert evaluation.primary_trigger.type == "HARD_STOP"
+
+
+class TestEvaluateHeldPositionRunnerTrim:
+    """The runner rule applies to every sleeve, unconditionally — including
+    when there's no fresh (or any) conviction score this run, since it's a
+    structural concentration cap, not a thesis judgment."""
+
+    def test_fires_for_core_despite_no_other_signal_based_exits(self):
+        evaluation = evaluate_held_position(
+            ticker="VTI", current_price=100.0, avg_cost=100.0, peak_price=100.0, atr_14=1.0,
+            weight_pct=31.0, conviction_now=90.0, conviction_at_entry=90.0, scaling=SCALING, config=RISK,
+            sleeve="CORE",
+        )
+        assert [t.type for t in evaluation.triggers] == ["RUNNER_TRIM"]
+
+    def test_fires_for_hedge_cash(self):
+        evaluation = evaluate_held_position(
+            ticker="IAU", current_price=100.0, avg_cost=100.0, peak_price=100.0, atr_14=1.0,
+            weight_pct=31.0, conviction_now=90.0, conviction_at_entry=90.0, scaling=SCALING, config=RISK,
+            sleeve="HEDGE_CASH",
+        )
+        assert [t.type for t in evaluation.triggers] == ["RUNNER_TRIM"]
+
+    def test_fires_for_speculative_alongside_hard_stop_check(self):
+        evaluation = evaluate_held_position(
+            ticker="RKLB", current_price=100.0, avg_cost=100.0, peak_price=100.0, atr_14=1.0,
+            weight_pct=31.0, conviction_now=90.0, conviction_at_entry=90.0, scaling=SCALING, config=RISK,
+            sleeve="SPECULATIVE", hard_stop_pct=-60,
+        )
+        assert [t.type for t in evaluation.triggers] == ["RUNNER_TRIM"]
+
+    def test_fires_even_with_no_conviction_score_at_all(self):
+        # An unresearched position still gets the runner rule — it's not a
+        # thesis judgment, it needs no conviction score to apply.
+        evaluation = evaluate_held_position(
+            ticker="NVDA", current_price=100.0, avg_cost=100.0, peak_price=100.0, atr_14=1.0,
+            weight_pct=31.0, conviction_now=None, conviction_at_entry=None, scaling=SCALING, config=RISK,
+        )
+        assert [t.type for t in evaluation.triggers] == ["RUNNER_TRIM"]
+
+    def test_no_conviction_score_and_below_trigger_produces_no_signal(self):
+        evaluation = evaluate_held_position(
+            ticker="NVDA", current_price=100.0, avg_cost=100.0, peak_price=100.0, atr_14=1.0,
+            weight_pct=10.0, conviction_now=None, conviction_at_entry=None, scaling=SCALING, config=RISK,
+        )
+        assert evaluation.has_exit_signal is False
+
+    def test_is_first_priority_for_swing_over_all_other_triggers(self):
+        # Rig it so trailing stop, thesis decay, and conviction floor would
+        # all also fire — RUNNER_TRIM must still win as primary_trigger.
+        evaluation = evaluate_held_position(
+            ticker="AMD", current_price=50.0, avg_cost=100.0, peak_price=200.0, atr_14=1.0,
+            weight_pct=31.0, conviction_now=0.0, conviction_at_entry=90.0, scaling=SCALING, config=RISK,
+        )
+        assert evaluation.primary_trigger.type == "RUNNER_TRIM"
+
+    def test_below_trigger_pct_never_fires(self):
+        evaluation = evaluate_held_position(
+            ticker="AMD", current_price=100.0, avg_cost=100.0, peak_price=100.0, atr_14=1.0,
+            weight_pct=12.0, conviction_now=90.0, conviction_at_entry=90.0, scaling=SCALING, config=RISK,
+        )
+        assert evaluation.has_exit_signal is False
+
+    def test_default_weight_pct_never_fires(self):
+        # weight_pct defaults to 0.0 — every pre-existing call site/test
+        # that doesn't know about the runner rule keeps working unchanged.
+        evaluation = evaluate_held_position(
+            ticker="AMD", current_price=105, avg_cost=100, peak_price=108, atr_14=2.0,
+            conviction_now=70, conviction_at_entry=70, scaling=SCALING, config=RISK,
+        )
+        assert evaluation.has_exit_signal is False
 
 
 class TestEvaluateHeldPosition:

@@ -232,8 +232,11 @@ class TestSleeveWiring:
         script = [FakeResponse(parsed_output=memo(subscore=5.0, thesis_summary="VTI thesis gutted"))]
         llm = make_llm(tmp_path, script)
         config = make_config()
+        # Cash large enough that VTI's weight (~10%) stays well under the
+        # runner rule's 30% threshold — this test isolates CORE's immunity
+        # to conviction-floor/thesis-decay/trailing-stop, not the runner rule.
         run_inputs = NightlyRunInputs(
-            as_of=dt.datetime(2026, 9, 1), universe_tickers=["VTI"], held_tickers=["VTI"], cash=usd(1_000.0)
+            as_of=dt.datetime(2026, 9, 1), universe_tickers=["VTI"], held_tickers=["VTI"], cash=usd(27_000.0)
         )
         briefing = run_nightly(session=session, portfolio=portfolio, gateway=gateway, llm=llm, config=config, inputs=run_inputs)
         vti_entry = next(b for b in briefing.book if b.ticker == "VTI")
@@ -305,6 +308,73 @@ class TestSleeveWiring:
         briefing = run_nightly(session=session, portfolio=portfolio, gateway=gateway, llm=llm, config=config, inputs=run_inputs)
         rklb_entry = next(b for b in briefing.book if b.ticker == "RKLB")
         assert rklb_entry.oversized_speculative is False
+
+
+class TestRunnerRule:
+    def test_core_position_over_30pct_nav_trims_to_25pct_not_full_exit(self, session, portfolio, tmp_path):
+        portfolio.add_manual_position("VTI", qty=100, avg_cost=100.0, opened_at=dt.datetime(2026, 7, 1))
+        gateway = FakeGateway(inputs={"VTI": screener_input("VTI", is_held=True)}, prices={"VTI": 100.0})
+        script = [FakeResponse(parsed_output=memo(subscore=90.0))]  # high conviction — irrelevant to the runner rule
+        llm = make_llm(tmp_path, script)
+        config = make_config()
+        # value = 100*$100 = $10,000; cash=$10,000 -> NAV=$20,000, weight=50%
+        run_inputs = NightlyRunInputs(
+            as_of=dt.datetime(2026, 9, 1), universe_tickers=["VTI"], held_tickers=["VTI"], cash=usd(10_000.0)
+        )
+        briefing = run_nightly(session=session, portfolio=portfolio, gateway=gateway, llm=llm, config=config, inputs=run_inputs)
+        proposals = {p.ticker: p for p in session.execute(select(Proposal)).scalars()}
+        assert proposals["VTI"].trigger_type == "RUNNER_TRIM"
+        assert proposals["VTI"].action == "SELL"
+        assert proposals["VTI"].quantity == 50  # trims to 25% of $20,000 NAV = $5,000 = 50 shares, not a full exit
+        assert briefing.actions_today[0].headline.startswith("Trim to 25%")
+
+    def test_position_below_30pct_nav_never_trims_purely_for_having_grown(self, session, portfolio, tmp_path):
+        # 20% NAV, well above the 12% entry limit that constrains new BUYs
+        # — entry limits never retroactively trim a held position.
+        portfolio.add_manual_position("VTI", qty=100, avg_cost=100.0, opened_at=dt.datetime(2026, 7, 1))
+        gateway = FakeGateway(inputs={"VTI": screener_input("VTI", is_held=True)}, prices={"VTI": 100.0})
+        script = [FakeResponse(parsed_output=memo(subscore=90.0))]
+        llm = make_llm(tmp_path, script)
+        config = make_config()
+        # value=$10,000; cash=$40,000 -> NAV=$50,000, weight=20%
+        run_inputs = NightlyRunInputs(
+            as_of=dt.datetime(2026, 9, 1), universe_tickers=["VTI"], held_tickers=["VTI"], cash=usd(40_000.0)
+        )
+        briefing = run_nightly(session=session, portfolio=portfolio, gateway=gateway, llm=llm, config=config, inputs=run_inputs)
+        assert briefing.actions_today == []
+
+    def test_speculative_position_crossing_15pct_nav_reclassifies_to_swing(self, session, portfolio, tmp_path):
+        portfolio.add_manual_position("RKLB", qty=150, avg_cost=100.0, opened_at=dt.datetime(2026, 7, 1))
+        gateway = FakeGateway(
+            inputs={"RKLB": screener_input("RKLB", is_held=True, technical=technical(atr_14=1.0))},
+            prices={"RKLB": 100.0},
+        )
+        script = [FakeResponse(parsed_output=memo(subscore=60.0))]
+        llm = make_llm(tmp_path, script)
+        config = make_config()
+        # value=150*$100=$15,000; cash=$85,000 -> NAV=$100,000, weight=15% exactly
+        run_inputs = NightlyRunInputs(
+            as_of=dt.datetime(2026, 9, 1), universe_tickers=["RKLB"], held_tickers=["RKLB"], cash=usd(85_000.0)
+        )
+        run_nightly(session=session, portfolio=portfolio, gateway=gateway, llm=llm, config=config, inputs=run_inputs)
+        assert portfolio.get_position("RKLB").sleeve == "SWING"
+        events = session.execute(select(RiskEvent).where(RiskEvent.type == "SLEEVE_RECLASSIFIED")).scalars().all()
+        assert len(events) == 1
+
+    def test_speculative_position_below_15pct_nav_stays_speculative(self, session, portfolio, tmp_path):
+        portfolio.add_manual_position("RKLB", qty=3, avg_cost=100.0, opened_at=dt.datetime(2026, 7, 1))
+        gateway = FakeGateway(
+            inputs={"RKLB": screener_input("RKLB", is_held=True, technical=technical(atr_14=1.0))},
+            prices={"RKLB": 100.0},
+        )
+        script = [FakeResponse(parsed_output=memo(subscore=60.0))]
+        llm = make_llm(tmp_path, script)
+        config = make_config()
+        run_inputs = NightlyRunInputs(
+            as_of=dt.datetime(2026, 9, 1), universe_tickers=["RKLB"], held_tickers=["RKLB"], cash=usd(100_000.0)
+        )
+        run_nightly(session=session, portfolio=portfolio, gateway=gateway, llm=llm, config=config, inputs=run_inputs)
+        assert portfolio.get_position("RKLB").sleeve == "SPECULATIVE"
 
 
 class TestCEnterGate:
@@ -685,7 +755,10 @@ class TestUnresearchedHoldings:
             as_of=dt.datetime(2026, 8, 25, 22, 0, 0),
             universe_tickers=build_universe(held_tickers=["NBIS"], watchlist=[], scan_tickers=[]),
             held_tickers=["NBIS"],
-            cash=usd(100.0),
+            # Cash large enough that NBIS's weight stays well under the
+            # runner rule's 30% threshold — this test isolates the
+            # no-fabricated-conviction guarantee, not the runner rule.
+            cash=usd(7_200.0),
         )
 
         briefing = run_nightly(session=session, config=config, gateway=gateway, llm=llm, portfolio=portfolio, inputs=run_inputs)
@@ -741,7 +814,9 @@ class TestConvictionFloorIntegration:
             as_of=dt.datetime(2026, 8, 25, 22, 0, 0),
             universe_tickers=build_universe(held_tickers=["MRVL"], watchlist=[], scan_tickers=[]),
             held_tickers=["MRVL"],
-            cash=usd(100.0),
+            # Cash large enough that MRVL's weight stays well under the
+            # runner rule's 30% threshold, isolating conviction-floor's own logic.
+            cash=usd(4_000.0),
         )
 
         briefing = run_nightly(session=session, config=config, gateway=gateway, llm=llm, portfolio=portfolio, inputs=run_inputs)
@@ -773,7 +848,9 @@ class TestConvictionFloorIntegration:
             as_of=dt.datetime(2026, 8, 25, 22, 0, 0),
             universe_tickers=build_universe(held_tickers=["MRVL"], watchlist=[], scan_tickers=[]),
             held_tickers=["MRVL"],
-            cash=usd(100.0),
+            # Cash large enough that MRVL's weight stays well under the
+            # runner rule's 30% threshold, isolating conviction-floor's own logic.
+            cash=usd(4_000.0),
         )
 
         briefing = run_nightly(session=session, config=config, gateway=gateway, llm=llm, portfolio=portfolio, inputs=run_inputs)
@@ -803,7 +880,9 @@ class TestConvictionFloorIntegration:
             as_of=dt.datetime(2026, 8, 25, 22, 0, 0),
             universe_tickers=build_universe(held_tickers=["RKLB"], watchlist=[], scan_tickers=[]),
             held_tickers=["RKLB"],
-            cash=usd(100.0),
+            # Cash large enough that RKLB's weight stays well under the
+            # runner rule's 30% threshold, isolating the conviction-floor tradeoff.
+            cash=usd(4_000.0),
         )
 
         briefing = run_nightly(session=session, config=config, gateway=gateway, llm=llm, portfolio=portfolio, inputs=run_inputs)
@@ -917,7 +996,10 @@ class TestHoldingsCadenceAndNoFabricatedScores:
         session.flush()
         gateway = FakeGateway(inputs={"NBIS": screener_input("NBIS", is_held=True, technical=technical(atr_14=3.0))}, prices={"NBIS": 150.0})
         llm = make_llm(tmp_path, [RuntimeError("credit balance too low")] * 3)
-        run_inputs = NightlyRunInputs(as_of=dt.datetime(2026, 8, 25, 22), universe_tickers=["NBIS"], held_tickers=["NBIS"], cash=usd(1000.0))
+        # Cash large enough that NBIS's weight stays well under the runner
+        # rule's 30% threshold — this test isolates the
+        # no-fabricated-conviction guarantee, not the runner rule.
+        run_inputs = NightlyRunInputs(as_of=dt.datetime(2026, 8, 25, 22), universe_tickers=["NBIS"], held_tickers=["NBIS"], cash=usd(12_000.0))
         briefing = run_nightly(session=session, config=make_config(), gateway=gateway, llm=llm, portfolio=portfolio, inputs=run_inputs)
 
         assert briefing.actions_today == []

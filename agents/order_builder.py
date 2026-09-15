@@ -78,19 +78,31 @@ def build_exit_order(
     conviction: float,
     evaluation: HeldPositionEvaluation,
     config: OrderBuilderConfig,
+    nav_usd: float | None = None,
+    runner_trim_target_pct: float | None = None,
 ) -> OrderProposal | None:
     """§3's NBIS example: a PROFIT_BAND trigger is a partial trim ("trim
     50%"), while §5.3's trailing-stop/thesis-decay triggers are framed as
     exits — this module reads that as: PROFIT_BAND sells
     `profit_trim_fraction` of the position, TRAILING_STOP and THESIS_DECAY
     sell all of it. Not stated explicitly in the spec; a judgment call like
-    step 4/6's ranking rules."""
+    step 4/6's ranking rules.
+
+    RUNNER_TRIM (the runner rule, Part 4) is neither: it trims down to
+    `runner_trim_target_pct` of NAV, not a fixed fraction and not a full
+    exit — "trims to 25%, not back to entry weight." Needs `nav_usd` and
+    `runner_trim_target_pct` to do that math; if either is missing (should
+    never happen — the orchestrator always passes them when a RUNNER_TRIM
+    evaluation exists) it falls back to a full exit, the safe default."""
     if not evaluation.has_exit_signal or held_qty <= 0 or current_price <= 0:
         return None
 
     primary = evaluation.primary_trigger
     if primary.type == "PROFIT_BAND":
         quantity = max(1, math.floor(held_qty * config.profit_trim_fraction))
+    elif primary.type == "RUNNER_TRIM" and nav_usd is not None and runner_trim_target_pct is not None:
+        target_qty = (nav_usd * (runner_trim_target_pct / 100.0)) / current_price
+        quantity = max(1, math.floor(held_qty - target_qty))
     else:
         quantity = math.floor(held_qty)
     quantity = min(quantity, math.floor(held_qty))

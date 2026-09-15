@@ -93,3 +93,45 @@ class TestBuildExitOrder:
     def test_none_when_held_qty_zero(self):
         order = build_exit_order("NBIS", 0, 200.0, 0, 61, self.evaluation_with("TRAILING_STOP"), CONFIG)
         assert order is None
+
+    def test_runner_trim_sells_down_to_target_pct_of_nav(self):
+        # held_qty=100 * price=10 = $1,000 value; nav=$2,000 -> weight=50%.
+        # Target 25% of nav = $500 -> target_qty=50 -> sell the other 50.
+        order = build_exit_order(
+            "NBIS", held_qty=100, current_price=10.0, weight_pct=50.0, conviction=61,
+            evaluation=self.evaluation_with("RUNNER_TRIM"), config=CONFIG,
+            nav_usd=2000.0, runner_trim_target_pct=25.0,
+        )
+        assert order.action == "SELL"
+        assert order.quantity == 50
+        assert order.is_trim is True
+        assert order.trigger_type == "RUNNER_TRIM"
+
+    def test_runner_trim_never_sells_more_than_held(self):
+        # Degenerate case: target_qty would be negative (nav tiny relative
+        # to position) — never sell more than held_qty.
+        order = build_exit_order(
+            "NBIS", held_qty=10, current_price=10.0, weight_pct=90.0, conviction=61,
+            evaluation=self.evaluation_with("RUNNER_TRIM"), config=CONFIG,
+            nav_usd=100.0, runner_trim_target_pct=25.0,
+        )
+        assert order.quantity <= 10
+
+    def test_runner_trim_without_nav_context_falls_back_to_full_exit(self):
+        # Defensive default when nav_usd/runner_trim_target_pct aren't
+        # wired (shouldn't happen in practice — the orchestrator always
+        # passes them) — never leaves a bigger position than intended.
+        order = build_exit_order(
+            "NBIS", held_qty=8, current_price=200.0, weight_pct=31.0, conviction=61,
+            evaluation=self.evaluation_with("RUNNER_TRIM"), config=CONFIG,
+        )
+        assert order.quantity == 8
+
+    def test_runner_trim_takes_priority_label_over_other_triggers(self):
+        order = build_exit_order(
+            "NBIS", held_qty=100, current_price=10.0, weight_pct=50.0, conviction=61,
+            evaluation=self.evaluation_with("RUNNER_TRIM", "TRAILING_STOP"), config=CONFIG,
+            nav_usd=2000.0, runner_trim_target_pct=25.0,
+        )
+        assert order.trigger_type == "RUNNER_TRIM"
+        assert order.quantity == 50  # the runner-trim math, not a full exit

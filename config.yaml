@@ -141,6 +141,16 @@ risk:
   # exit, regardless of P&L or entry baseline. Not used by CORE/HEDGE_CASH/
   # SPECULATIVE — see core/risk_rules.py's sleeve gating.
   min_hold_conviction: 42.0
+  # The runner rule (user-requested, 2026-09-15): entry limits above
+  # (max_position_pct, sector/cluster caps) constrain what a NEW position
+  # can be sized to — they never trim a position for having grown past
+  # them by appreciation. Applies to every sleeve regardless of that
+  # sleeve's other exit gating (the "concentration breach" CORE/HEDGE_CASH
+  # can still be trimmed on). Never trims for growth alone below
+  # runner_trim_trigger_pct; crossing it trims down to runner_trim_target_pct,
+  # not back to any entry weight.
+  runner_trim_trigger_pct: 30.0
+  runner_trim_target_pct: 25.0
 
 conviction_weights:                 # auto-normalised; add or remove freely
   business_quality: 0.15

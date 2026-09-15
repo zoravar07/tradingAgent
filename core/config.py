@@ -116,6 +116,17 @@ class RiskConfig(BaseModel):
     reference_atr_pct_of_price: float = 3.0
     min_volatility_size_multiplier: float = 0.25
     thesis_decay_trigger_pts: float = 15.0
+    # The runner rule (user-requested, 2026-09-15): entry limits
+    # (max_position_pct, sector/cluster caps above) constrain what a NEW
+    # position can be sized to — they never trim a position for having
+    # grown past them by appreciation. Applies to every sleeve, regardless
+    # of that sleeve's other exit-machinery gating (it's the "concentration
+    # breach" CORE/HEDGE_CASH can still be trimmed on) — see
+    # core/risk_rules.py's runner_trim_triggered. Never trims for growth
+    # alone below runner_trim_trigger_pct; crossing it trims down to
+    # runner_trim_target_pct, not back to any entry weight.
+    runner_trim_trigger_pct: float = 30.0
+    runner_trim_target_pct: float = 25.0
     # C_enter / C_exit — user-requested recalibration of the portfolio
     # framework document's conviction bands (2026-09-15 decision). The
     # framework doc specifies C_enter 65 / C_exit 55, but those don't match

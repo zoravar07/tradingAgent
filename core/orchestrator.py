@@ -76,7 +76,6 @@ from core.money import Money, usd
 from core.nav import compute_nav, record_nav
 from core.portfolio import PortfolioService
 from core.risk_rules import (
-    HeldPositionEvaluation,
     ScoredProposal,
     check_kill_switches,
     enforce_daily_proposal_cap,
@@ -500,6 +499,33 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row, new
         if current_price is None:
             continue  # fetch already failed and was logged above
 
+        value_usd = pos.qty * current_price  # plain float — FMP quote, unambiguously USD
+        weight_pct = (value_usd / nav.amount * 100) if nav.amount else 0.0
+        unrealized_pnl_pct = ((current_price - pos.avg_cost) / pos.avg_cost * 100) if pos.avg_cost else 0.0
+
+        # SPECULATIVE -> SWING reclassification (Part 4's other half of the
+        # runner rule): crossing reclass_at_pct of NAV means the position
+        # graduated past "small speculative bet" and should get SWING's
+        # full active risk management from this run forward, not just a
+        # hard stop. Checked before this run's exit evaluation so a
+        # position that reclassifies this run is immediately evaluated
+        # under its new sleeve, not next run.
+        if pos.sleeve == "SPECULATIVE":
+            speculative_defn_for_reclass = config.sleeves.definitions.get("SPECULATIVE")
+            if (
+                speculative_defn_for_reclass is not None
+                and speculative_defn_for_reclass.reclass_at_pct is not None
+                and weight_pct >= speculative_defn_for_reclass.reclass_at_pct
+            ):
+                portfolio.reclassify_sleeve(pos.id, "SWING")
+                session.add(RiskEvent(
+                    run_id=run_row.id, type="SLEEVE_RECLASSIFIED",
+                    detail_json=json.dumps({
+                        "ticker": pos.ticker, "from_sleeve": "SPECULATIVE", "to_sleeve": "SWING",
+                        "weight_pct": weight_pct, "reclass_at_pct": speculative_defn_for_reclass.reclass_at_pct,
+                    }),
+                ))
+
         screener_input = screener_inputs.get(pos.ticker)
         atr_14 = screener_input.technical.atr_14 if screener_input else None
         has_fresh_conviction = pos.ticker in conviction_by_ticker
@@ -527,46 +553,47 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row, new
             pos.peak_price_since_activation, current_price, pos.avg_cost, conviction_now, config.conviction_scaling
         )
 
-        if conviction_now is None:
-            evaluation = HeldPositionEvaluation(ticker=pos.ticker, triggers=[])
-        else:
-            sleeve_defn = config.sleeves.definitions.get(pos.sleeve)
-            evaluation = evaluate_held_position(
-                ticker=pos.ticker,
-                current_price=current_price,
-                avg_cost=pos.avg_cost,
-                peak_price=pos.peak_price_since_activation,
-                atr_14=atr_14,
-                conviction_now=conviction_now,
-                # Only pass a real conviction_at_entry when conviction_now is
-                # also real this run. Without this, when unresearched,
-                # conviction_now's fallback above (`pos.conviction_at_entry or
-                # 50.0`) is self-referential when conviction_at_entry is set —
-                # it already produces drop=0 (no false trigger) by coincidence,
-                # not by a check that says so. Making it explicit here means
-                # thesis-decay's "no signal without real research" guarantee
-                # holds by construction, not by an accident of how the fallback
-                # happens to be written — the fallback logic could change later
-                # without anyone noticing it was quietly relied upon for this.
-                # Trailing-stop/profit-band still use the fallback conviction_now
-                # for scaling — those only need *some* reasonable basis, not a
-                # fresh one, unlike thesis-decay's entry-vs-now comparison.
-                conviction_at_entry=pos.conviction_at_entry if has_fresh_conviction else None,
-                scaling=config.conviction_scaling,
-                config=config.risk,
-                # Same reasoning as the conviction_at_entry guard above: the
-                # conviction floor (§ user-requested, core/risk_rules.py) looks
-                # at conviction_now alone, so it needs its own explicit guard
-                # against firing on a fabricated fallback rather than relying on
-                # thesis-decay's guard to somehow cover it too.
-                conviction_is_fresh=has_fresh_conviction,
-                sleeve=pos.sleeve,
-                hard_stop_pct=sleeve_defn.hard_stop_pct if sleeve_defn else None,
-            )
-
-        value_usd = pos.qty * current_price  # plain float — FMP quote, unambiguously USD
-        weight_pct = (value_usd / nav.amount * 100) if nav.amount else 0.0
-        unrealized_pnl_pct = ((current_price - pos.avg_cost) / pos.avg_cost * 100) if pos.avg_cost else 0.0
+        # Always evaluated, even with no conviction score this run — the
+        # runner rule (RUNNER_TRIM, Part 4) needs no conviction score at
+        # all, unlike the other four triggers. evaluate_held_position
+        # itself checks RUNNER_TRIM first and returns early when
+        # conviction_now is None, so an unresearched position still gets
+        # the runner rule but nothing else (preserving the existing "no
+        # signal without real research" guarantee for the other four).
+        sleeve_defn = config.sleeves.definitions.get(pos.sleeve)
+        evaluation = evaluate_held_position(
+            ticker=pos.ticker,
+            current_price=current_price,
+            avg_cost=pos.avg_cost,
+            peak_price=pos.peak_price_since_activation,
+            atr_14=atr_14,
+            conviction_now=conviction_now,
+            # Only pass a real conviction_at_entry when conviction_now is
+            # also real this run. Without this, when unresearched,
+            # conviction_now's fallback above (`pos.conviction_at_entry or
+            # 50.0`) is self-referential when conviction_at_entry is set —
+            # it already produces drop=0 (no false trigger) by coincidence,
+            # not by a check that says so. Making it explicit here means
+            # thesis-decay's "no signal without real research" guarantee
+            # holds by construction, not by an accident of how the fallback
+            # happens to be written — the fallback logic could change later
+            # without anyone noticing it was quietly relied upon for this.
+            # Trailing-stop/profit-band still use the fallback conviction_now
+            # for scaling — those only need *some* reasonable basis, not a
+            # fresh one, unlike thesis-decay's entry-vs-now comparison.
+            conviction_at_entry=pos.conviction_at_entry if has_fresh_conviction else None,
+            scaling=config.conviction_scaling,
+            config=config.risk,
+            # Same reasoning as the conviction_at_entry guard above: the
+            # conviction floor (§ user-requested, core/risk_rules.py) looks
+            # at conviction_now alone, so it needs its own explicit guard
+            # against firing on a fabricated fallback rather than relying on
+            # thesis-decay's guard to somehow cover it too.
+            conviction_is_fresh=has_fresh_conviction,
+            sleeve=pos.sleeve,
+            hard_stop_pct=sleeve_defn.hard_stop_pct if sleeve_defn else None,
+            weight_pct=weight_pct,
+        )
 
         # Advisory only, never a forced trim (user-requested): a SPECULATIVE
         # position sized well above one slot — assigned to the sleeve
@@ -587,8 +614,15 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row, new
                     ))
 
         if evaluation.has_exit_signal:
+            # RUNNER_TRIM can fire with no conviction score at all (see
+            # above) — Proposal.conviction is a non-nullable column, so an
+            # unresearched position still needs *some* number here. 0.0 is
+            # a visible placeholder, not a real score, same spirit as the
+            # rest of this codebase's "surface, don't hide" philosophy.
+            conviction_for_order = conviction_now if conviction_now is not None else 0.0
             order = build_exit_order(
-                pos.ticker, pos.qty, current_price, weight_pct, conviction_now, evaluation, config.order_builder
+                pos.ticker, pos.qty, current_price, weight_pct, conviction_for_order, evaluation, config.order_builder,
+                nav_usd=nav.amount, runner_trim_target_pct=config.risk.runner_trim_target_pct,
             )
             if order is not None:
                 headline = {
@@ -596,6 +630,8 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row, new
                     "PROFIT_BAND": f"Trim {int(config.order_builder.profit_trim_fraction * 100)}%",
                     "THESIS_DECAY": "Thesis decay",
                     "CONVICTION_FLOOR": f"Conviction below floor ({config.risk.min_hold_conviction:.0f})",
+                    "HARD_STOP": "Hard stop triggered",
+                    "RUNNER_TRIM": f"Trim to {config.risk.runner_trim_target_pct:.0f}% (over {config.risk.runner_trim_trigger_pct:.0f}% of NAV)",
                 }.get(evaluation.primary_trigger.type, "Exit triggered")
                 memo = memo_by_ticker.get(pos.ticker)
                 action_items.append(

@@ -261,7 +261,7 @@ def enforce_daily_proposal_cap(proposals: list[ScoredProposal], config: RiskConf
 
 # ---------------------------------------------------------- held-position exits
 
-ExitTriggerType = Literal["TRAILING_STOP", "PROFIT_BAND", "THESIS_DECAY", "HARD_STOP"]
+ExitTriggerType = Literal["TRAILING_STOP", "PROFIT_BAND", "THESIS_DECAY", "HARD_STOP", "RUNNER_TRIM"]
 
 
 @dataclass
@@ -281,12 +281,17 @@ class HeldPositionEvaluation:
 
     @property
     def primary_trigger(self) -> ExitTrigger | None:
-        """§5.3 lists them in priority order: trailing stop breach · profit
-        band crossed · thesis decay. First triggered in that order wins when
-        a single label is needed (e.g. proposals.trigger_type).
-        CONVICTION_FLOOR (not in §5.3, user-requested) is checked last —
-        it's the catch-all for a position none of the other three caught,
-        so it never outranks a real price- or decay-based signal."""
+        """RUNNER_TRIM (user-requested, Part 4) is checked first, ahead of
+        everything else — a structural concentration cap outranks any
+        thesis- or price-based signal. Then §5.3's own priority order:
+        trailing stop breach · profit band crossed · thesis decay. First
+        triggered in that order wins when a single label is needed (e.g.
+        proposals.trigger_type). CONVICTION_FLOOR (not in §5.3,
+        user-requested) is checked last — it's the catch-all for a position
+        none of the other three caught, so it never outranks a real price-
+        or decay-based signal. HARD_STOP (SPECULATIVE only) and RUNNER_TRIM
+        are the only triggers that can appear together, since SPECULATIVE
+        never runs the other four at all."""
         return self.triggers[0] if self.triggers else None
 
 
@@ -322,6 +327,23 @@ def profit_band_crossed(
         return False, {"threshold_pct": threshold, "reason": "no cost basis"}
     gain_pct = (current_price - avg_cost) / avg_cost * 100.0
     return gain_pct >= threshold, {"threshold_pct": threshold, "gain_pct": gain_pct}
+
+
+def runner_trim_triggered(weight_pct: float, config: RiskConfig) -> tuple[bool, dict]:
+    """The runner rule (user-requested): entry limits (max_position_pct,
+    sector/cluster caps) constrain what a NEW position can be sized to —
+    they never trim a position for having grown past them by appreciation.
+    Applies to every sleeve regardless of its other exit-machinery gating
+    (it's the "concentration breach" CORE/HEDGE_CASH can still be trimmed
+    on). Never trims for growth alone below runner_trim_trigger_pct;
+    crossing it trims down to runner_trim_target_pct, not back to any
+    entry weight."""
+    breached = weight_pct > config.runner_trim_trigger_pct
+    return breached, {
+        "weight_pct": weight_pct,
+        "trigger_pct": config.runner_trim_trigger_pct,
+        "target_pct": config.runner_trim_target_pct,
+    }
 
 
 def hard_stop_breached(current_price: float, avg_cost: float, hard_stop_pct: float) -> tuple[bool, dict]:
@@ -367,13 +389,14 @@ def evaluate_held_position(
     avg_cost: float,
     peak_price: float | None,
     atr_14: float | None,
-    conviction_now: float,
+    conviction_now: float | None,
     conviction_at_entry: float | None,
     scaling: ConvictionScalingConfig,
     config: RiskConfig,
     conviction_is_fresh: bool = True,
     sleeve: str = "SWING",
     hard_stop_pct: float | None = None,
+    weight_pct: float = 0.0,
 ) -> HeldPositionEvaluation:
     """`conviction_is_fresh=False` means `conviction_now` is a fallback, not
     a real score computed this run (see core/orchestrator.py) — thesis-decay
@@ -384,22 +407,35 @@ def evaluate_held_position(
 
     `sleeve` gates which exit machinery applies at all (user-requested
     sleeve architecture): CORE and HEDGE_CASH get no signal-based exits
-    whatsoever — they only ever exit via the concentration-based runner-rule
-    trim, which lives outside this function. SPECULATIVE swaps all four
-    triggers for a single hard_stop_pct floor. Only SWING runs the original
-    four, in their original priority order."""
+    whatsoever — they only ever exit via the runner-rule trim below.
+    SPECULATIVE swaps all four conviction/price triggers for a single
+    hard_stop_pct floor. Only SWING runs the original four, in their
+    original priority order.
+
+    The runner rule (RUNNER_TRIM, `weight_pct`) is the one exception to all
+    of that gating: it applies to every sleeve unconditionally, and even
+    when `conviction_now` is None (no research coverage this run) — it's a
+    structural concentration cap, not a thesis judgment, so it's checked
+    first, ahead of everything else, and can be the sole trigger on an
+    otherwise-unmonitored position."""
+    triggers: list[ExitTrigger] = []
+
+    trim_hit, trim_detail = runner_trim_triggered(weight_pct, config)
+    if trim_hit:
+        triggers.append(ExitTrigger(type="RUNNER_TRIM", detail=trim_detail))
+
+    if conviction_now is None:
+        return HeldPositionEvaluation(ticker=ticker, triggers=triggers)
+
     if sleeve in ("CORE", "HEDGE_CASH"):
-        return HeldPositionEvaluation(ticker=ticker, triggers=[])
+        return HeldPositionEvaluation(ticker=ticker, triggers=triggers)
 
     if sleeve == "SPECULATIVE":
-        triggers: list[ExitTrigger] = []
         if hard_stop_pct is not None:
             stop_hit, stop_detail = hard_stop_breached(current_price, avg_cost, hard_stop_pct)
             if stop_hit:
                 triggers.append(ExitTrigger(type="HARD_STOP", detail=stop_detail))
         return HeldPositionEvaluation(ticker=ticker, triggers=triggers)
-
-    triggers = []
 
     stop_hit, stop_detail = trailing_stop_breached(current_price, peak_price, atr_14, conviction_now, scaling)
     if stop_hit:

@@ -36,7 +36,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from agents.order_builder import build_buy_order, build_exit_order
-from agents.research import ResearchContext, run_research_batch
+from agents.research import NewsDigest, ResearchContext, run_news_digest, run_research_batch
 from agents.screener import (
     ScreenerInput,
     run_stage1,
@@ -50,6 +50,7 @@ from core.briefing import (
     Briefing,
     OvernightChange,
     PortfolioHealth,
+    SleeveBreachAdvisory,
     UnpricedPosition,
     UnresearchedHolding,
     WatchlistItem as BriefingWatchlistItem,
@@ -59,20 +60,39 @@ from core.briefing import (
 from core.config import Config, UniverseConfig
 from core.llm import LLMClient
 from core.briefing_persistence import serialize_briefing
-from core.models import BriefingRecord, Candidate, Conviction as ConvictionRow, Proposal, ResearchOutput, RiskEvent, Run
+from core.cache import FileCache
+from core.models import (
+    BriefingRecord,
+    Candidate,
+    Conviction as ConvictionRow,
+    Proposal,
+    ResearchOutput,
+    RiskEvent,
+    Run,
+    SleeveBreachState,
+)
 from core.models import WatchlistItem as WatchlistItemRow
 from core.money import Money, usd
 from core.nav import compute_nav, record_nav
 from core.portfolio import PortfolioService
 from core.risk_rules import (
+    HeldPositionEvaluation,
     ScoredProposal,
     check_kill_switches,
     enforce_daily_proposal_cap,
     evaluate_held_position,
     size_new_position,
+    size_speculative_position,
     update_peak_price,
 )
 from core.scoring import compute_conviction
+from core.sleeves import (
+    SleeveBreachStatus,
+    resolve_sleeve,
+    sleeve_room,
+    speculative_look_reasons,
+    update_breach_streak,
+)
 
 logger = logging.getLogger("z_money.orchestrator")
 
@@ -116,14 +136,17 @@ def rotating_slice(pool: list[str], batch_size: int, day_index: int) -> list[str
 def resolve_universe(
     *, held_tickers: list[str], pool: list[str], config: UniverseConfig, as_of: dt.datetime
 ) -> list[str]:
-    """Ties `config.universe` together: a full-pool scan on the configured
-    weekly-wide-scan day (if enabled), otherwise a rotating slice sized to
-    `rotating_scan_size`, merged with holdings and the watchlist."""
-    if config.weekly_wide_scan.enabled and as_of.weekday() == config.weekly_wide_scan.day_of_week:
-        scan_tickers = pool
+    """Ties `config.universe` together: the whole pool when
+    `rotating_scan_size` is 0 or on the weekly-wide-scan day (if enabled),
+    otherwise a rotating slice of that many names; merged with holdings, the
+    watchlist, and `extra_tickers` (which, like the watchlist, are scanned
+    every day rather than rotated)."""
+    wide_day = config.weekly_wide_scan.enabled and as_of.weekday() == config.weekly_wide_scan.day_of_week
+    if config.rotating_scan_size <= 0 or wide_day:
+        scan_tickers = list(pool)
     else:
         scan_tickers = rotating_slice(pool, config.rotating_scan_size, as_of.toordinal())
-    return build_universe(held_tickers, config.watchlist, scan_tickers)
+    return build_universe(held_tickers, [*config.watchlist, *config.extra_tickers], scan_tickers)
 
 
 @dataclass
@@ -160,6 +183,7 @@ def run_nightly(
     llm: LLMClient,
     portfolio: PortfolioService,
     inputs: NightlyRunInputs,
+    news_cache: FileCache | None = None,
 ) -> Briefing:
     logger.info("run start as_of=%s universe_size=%d", inputs.as_of, len(inputs.universe_tickers))
     run_row = Run(
@@ -173,7 +197,7 @@ def run_nightly(
     session.flush()
 
     try:
-        briefing = _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row)
+        briefing = _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row, news_cache)
         run_row.status = "blocked" if briefing.blocked is not None else "succeeded"
         run_row.finished_at = _utcnow()
         # §10 step 10 gap: persist the assembled Briefing itself, not just
@@ -195,7 +219,7 @@ def run_nightly(
         raise
 
 
-def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> Briefing:
+def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row, news_cache=None) -> Briefing:
     held_set = {t.upper() for t in inputs.held_tickers}
 
     # ------------------------------------------------------- Pricing gate (§0)
@@ -245,6 +269,16 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
     research_gap_reason: dict[str, str] = {}
 
     # ---------------------------------------------------------------- Stage 1
+    # Batch-warm price history first (optional on the gateway — the fakes
+    # in tests don't have it). One failed batch just means per-ticker fetches.
+    prefetch = getattr(gateway, "prefetch", None)
+    if callable(prefetch):
+        try:
+            cached = prefetch(list(inputs.universe_tickers))
+            logger.info("prefetched history for %s/%d universe names", cached, len(inputs.universe_tickers))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("history prefetch failed, falling back to per-ticker fetches: %s", exc)
+
     screener_inputs: dict[str, ScreenerInput] = {}
     for ticker in inputs.universe_tickers:
         try:
@@ -270,7 +304,7 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
     logger.info("stage1 survivors=%d/%d", len(stage1_survivors), len(stage1_results))
 
     # ---------------------------------------------------------------- Stage 2
-    stage2_results = run_stage2_batch(llm, stage1_survivors, config.screener.stage2)
+    stage2_results = run_stage2_batch(llm, stage1_survivors, config.screener.stage2, screener_inputs)
     candidate_rows = {
         row.ticker: row
         for row in session.execute(select(Candidate).where(Candidate.run_id == run_row.id)).scalars()
@@ -286,8 +320,20 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
     logger.info("stage2 survivors=%d/%d", len(stage2_survivors), len(stage2_results))
 
     # --------------------------------------------------------------- Research
+    # New names: at most research.max_candidates_per_run, best Stage 2 score
+    # first. Held names: only those due on the holdings refresh cadence
+    # (never-researched ones always; otherwise the oldest few) — the rest
+    # reuse their last real conviction score below, flagged with its age.
+    new_targets = [r for r in stage2_survivors if not r.is_held][: config.research.max_candidates_per_run]
+    due_held = holdings_due_for_refresh(session, sorted(held_set), run_row.id, config.research.holdings_refresh_days)
+    held_targets = [r for r in stage2_survivors if r.is_held and r.ticker in due_held]
+    research_targets = held_targets + new_targets
+    logger.info(
+        "research targets=%d (held due %d/%d, new %d)", len(research_targets), len(held_targets), len(held_set), len(new_targets)
+    )
+
     research_contexts: list[ResearchContext] = []
-    for r in stage2_survivors:
+    for r in research_targets:
         try:
             context_text = gateway.get_research_context(r.ticker)
         except Exception as exc:  # noqa: BLE001 — one bad context fetch must not skip a Sonnet call for nothing, or kill the run
@@ -296,6 +342,23 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
             research_gap_reason[r.ticker] = f"Research context fetch failed: {exc}"
             continue
         research_contexts.append(ResearchContext(ticker=r.ticker, context_text=context_text))
+
+    # Grounded news, one web-search call per researched name. This is the
+    # only place recent events enter the pipeline: the memo prompt below
+    # forbids events from memory, and the briefing's "Overnight changes"
+    # is built from these digests (held names, sourced items only) — not
+    # from Stage 2's triage verdict, which is the model answering "anything
+    # material lately?" from training data and was confabulating stale
+    # earnings figures (run 5's NVDA line).
+    digests_by_ticker: dict[str, NewsDigest] = {}
+    if config.research.web_search_enabled:
+        for ctx in research_contexts:
+            digest = run_news_digest(llm, ctx.ticker, config.research, cache=news_cache)
+            digests_by_ticker[ctx.ticker] = digest
+            ctx.news_digest = digest
+            if not digest.ok:
+                session.add(RiskEvent(run_id=run_row.id, type="NEWS_DIGEST_FAILED", detail_json=json.dumps({"ticker": ctx.ticker, "error": digest.error})))
+                logger.warning("news digest failed ticker=%s error=%s", ctx.ticker, digest.error)
     research_results = run_research_batch(llm, research_contexts, config.research)
 
     conviction_by_ticker: dict[str, float] = {}
@@ -314,7 +377,13 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
                 run_id=run_row.id,
                 ticker=rr.ticker,
                 subscores_json=json.dumps(memo.subscores()),
-                reasoning_json=json.dumps({"unavailable_factors": memo.unavailable_factors()}),
+                reasoning_json=json.dumps(
+                    {
+                        "unavailable_factors": memo.unavailable_factors(),
+                        "news_digest": digests_by_ticker[rr.ticker].text if rr.ticker in digests_by_ticker else None,
+                        "news_sources": digests_by_ticker[rr.ticker].source_urls if rr.ticker in digests_by_ticker else [],
+                    }
+                ),
                 consensus_view=memo.consensus_view,
                 variant_view=memo.variant_view,
                 bear_case_json=json.dumps(memo.bear_case.model_dump()),
@@ -349,6 +418,7 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
     position_values: list[Money] = []  # FMP quotes are always USD by construction — plain floats before wrapping
     sector_value: dict[str, Money] = {}
     cluster_value: dict[str, Money] = {}
+    sleeve_value: dict[str, Money] = {}
     for pos in held_positions:
         price = price_by_ticker.get(pos.ticker)
         if price is None:
@@ -361,15 +431,58 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
             sector_value[sector] = sector_value.get(sector, usd(0.0)) + value
         if cluster:
             cluster_value[cluster] = cluster_value.get(cluster, usd(0.0)) + value
+        sleeve_value[pos.sleeve] = sleeve_value.get(pos.sleeve, usd(0.0)) + value
 
     nav = compute_nav(position_values, inputs.cash)
     sector_pct = {k: (v / nav) * 100 for k, v in sector_value.items()} if nav.amount else {}
     cluster_pct = {k: (v / nav) * 100 for k, v in cluster_value.items()} if nav.amount else {}
+    sleeve_pct = {k: (v / nav) * 100 for k, v in sleeve_value.items()} if nav.amount else {}
+    # HEDGE_CASH's target/band includes uninvested cash, not just IAU's
+    # market value — the only sleeve where that's true (config-driven, not
+    # a hardcoded ticker check).
+    if nav.amount:
+        for name, defn in config.sleeves.definitions.items():
+            if defn.includes_account_cash:
+                sleeve_pct[name] = sleeve_pct.get(name, 0.0) + (inputs.cash / nav) * 100
     nav_status = record_nav(session, run_row.id, nav, inputs.as_of)
     logger.info(
         "nav=%s peak=%s drawdown_pct=%.2f daily_loss_pct=%.2f",
         nav_status.nav, nav_status.peak_nav, nav_status.drawdown_pct, nav_status.daily_loss_pct,
     )
+
+    # ---------------------------------------------- Sleeve sustained-breach streak
+    # Advisory only — a breach never forces a trade (user-requested). Streak
+    # persists across runs in sleeve_breach_state, one row per sleeve.
+    sleeve_band_breaches: list[SleeveBreachAdvisory] = []
+    for name, defn in config.sleeves.definitions.items():
+        weight_pct = sleeve_pct.get(name, 0.0)
+        state_row = session.get(SleeveBreachState, name)
+        previous = SleeveBreachStatus(
+            direction=state_row.direction if state_row else None,
+            streak_days=state_row.streak_days if state_row else 0,
+        )
+        updated = update_breach_streak(previous, weight_pct, defn, config.sleeves.breach_margin_pct)
+        if state_row is None:
+            state_row = SleeveBreachState(
+                sleeve=name, direction=updated.direction, streak_days=updated.streak_days, last_run_id=run_row.id
+            )
+            session.add(state_row)
+        else:
+            state_row.direction = updated.direction
+            state_row.streak_days = updated.streak_days
+            state_row.last_run_id = run_row.id
+        if updated.streak_days >= config.sleeves.breach_sustain_days:
+            session.add(RiskEvent(
+                run_id=run_row.id, type="REBALANCE_ADVISORY",
+                detail_json=json.dumps({
+                    "sleeve": name, "direction": updated.direction,
+                    "weight_pct": weight_pct, "streak_days": updated.streak_days,
+                }),
+            ))
+            sleeve_band_breaches.append(SleeveBreachAdvisory(
+                sleeve=name, direction=updated.direction, weight_pct=weight_pct, streak_days=updated.streak_days
+            ))
+    session.flush()
 
     # -------------------------------------------------------- Risk: run-level
     kill_status = check_kill_switches(nav_status.daily_loss_pct, nav_status.drawdown_pct, config.risk)
@@ -385,45 +498,69 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
         if current_price is None:
             continue  # fetch already failed and was logged above
 
-        pos.peak_price_since_activation = update_peak_price(pos.peak_price_since_activation, current_price)
-
         screener_input = screener_inputs.get(pos.ticker)
         atr_14 = screener_input.technical.atr_14 if screener_input else None
         has_fresh_conviction = pos.ticker in conviction_by_ticker
-        conviction_now = conviction_by_ticker.get(pos.ticker, pos.conviction_at_entry or 50.0)
-        if not has_fresh_conviction:
-            research_gap_reason.setdefault(pos.ticker, "no research coverage this run")
+        # No fresh memo this run: reuse the last REAL score on record (the
+        # holdings cadence, or a failed refresh), flagged with its age. There
+        # is no default — a position with no score on record is left
+        # unevaluated and reported as unmonitored rather than judged on a
+        # number nobody computed (runs 1-7 used a silent 50.0 here).
+        stale = None if has_fresh_conviction else latest_conviction(session, pos.ticker, before_run_id=run_row.id)
+        if has_fresh_conviction:
+            conviction_now: float | None = conviction_by_ticker[pos.ticker]
+        elif stale is not None:
+            conviction_now = stale.score
+            if pos.ticker in due_held:
+                research_gap_reason.setdefault(pos.ticker, "no research coverage this run")
+        else:
+            conviction_now = None
+            research_gap_reason.setdefault(pos.ticker, "no conviction score on record — never researched")
 
-        evaluation = evaluate_held_position(
-            ticker=pos.ticker,
-            current_price=current_price,
-            avg_cost=pos.avg_cost,
-            peak_price=pos.peak_price_since_activation,
-            atr_14=atr_14,
-            conviction_now=conviction_now,
-            # Only pass a real conviction_at_entry when conviction_now is
-            # also real this run. Without this, when unresearched,
-            # conviction_now's fallback above (`pos.conviction_at_entry or
-            # 50.0`) is self-referential when conviction_at_entry is set —
-            # it already produces drop=0 (no false trigger) by coincidence,
-            # not by a check that says so. Making it explicit here means
-            # thesis-decay's "no signal without real research" guarantee
-            # holds by construction, not by an accident of how the fallback
-            # happens to be written — the fallback logic could change later
-            # without anyone noticing it was quietly relied upon for this.
-            # Trailing-stop/profit-band still use the fallback conviction_now
-            # for scaling — those only need *some* reasonable basis, not a
-            # fresh one, unlike thesis-decay's entry-vs-now comparison.
-            conviction_at_entry=pos.conviction_at_entry if has_fresh_conviction else None,
-            scaling=config.conviction_scaling,
-            config=config.risk,
-            # Same reasoning as the conviction_at_entry guard above: the
-            # conviction floor (§ user-requested, core/risk_rules.py) looks
-            # at conviction_now alone, so it needs its own explicit guard
-            # against firing on a fabricated fallback rather than relying on
-            # thesis-decay's guard to somehow cover it too.
-            conviction_is_fresh=has_fresh_conviction,
+        # Gated on conviction_now (fresh or stale, whichever is available) —
+        # only the initial activation check needs a conviction score at all
+        # (see update_peak_price); once activated the running max no longer
+        # depends on one.
+        pos.peak_price_since_activation = update_peak_price(
+            pos.peak_price_since_activation, current_price, pos.avg_cost, conviction_now, config.conviction_scaling
         )
+
+        if conviction_now is None:
+            evaluation = HeldPositionEvaluation(ticker=pos.ticker, triggers=[])
+        else:
+            sleeve_defn = config.sleeves.definitions.get(pos.sleeve)
+            evaluation = evaluate_held_position(
+                ticker=pos.ticker,
+                current_price=current_price,
+                avg_cost=pos.avg_cost,
+                peak_price=pos.peak_price_since_activation,
+                atr_14=atr_14,
+                conviction_now=conviction_now,
+                # Only pass a real conviction_at_entry when conviction_now is
+                # also real this run. Without this, when unresearched,
+                # conviction_now's fallback above (`pos.conviction_at_entry or
+                # 50.0`) is self-referential when conviction_at_entry is set —
+                # it already produces drop=0 (no false trigger) by coincidence,
+                # not by a check that says so. Making it explicit here means
+                # thesis-decay's "no signal without real research" guarantee
+                # holds by construction, not by an accident of how the fallback
+                # happens to be written — the fallback logic could change later
+                # without anyone noticing it was quietly relied upon for this.
+                # Trailing-stop/profit-band still use the fallback conviction_now
+                # for scaling — those only need *some* reasonable basis, not a
+                # fresh one, unlike thesis-decay's entry-vs-now comparison.
+                conviction_at_entry=pos.conviction_at_entry if has_fresh_conviction else None,
+                scaling=config.conviction_scaling,
+                config=config.risk,
+                # Same reasoning as the conviction_at_entry guard above: the
+                # conviction floor (§ user-requested, core/risk_rules.py) looks
+                # at conviction_now alone, so it needs its own explicit guard
+                # against firing on a fabricated fallback rather than relying on
+                # thesis-decay's guard to somehow cover it too.
+                conviction_is_fresh=has_fresh_conviction,
+                sleeve=pos.sleeve,
+                hard_stop_pct=sleeve_defn.hard_stop_pct if sleeve_defn else None,
+            )
 
         value_usd = pos.qty * current_price  # plain float — FMP quote, unambiguously USD
         weight_pct = (value_usd / nav.amount * 100) if nav.amount else 0.0
@@ -462,11 +599,13 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
         book_entries.append(
             BookEntry(
                 ticker=pos.ticker, qty=pos.qty, value_usd=value_usd, weight_pct=weight_pct,
-                unrealized_pnl_pct=unrealized_pnl_pct, conviction_now=conviction_by_ticker.get(pos.ticker),
+                unrealized_pnl_pct=unrealized_pnl_pct, conviction_now=conviction_now,
                 conviction_at_entry=pos.conviction_at_entry,
+                conviction_run_id=stale.run_id if stale is not None else None,
+                conviction_age_days=((inputs.as_of - stale.started_at).total_seconds() / 86400) if stale is not None else None,
                 distance_to_trailing_stop_pct=_distance_to_stop_pct(evaluation, current_price),
                 has_exit_trigger=evaluation.has_exit_signal,
-                no_research_coverage=not has_fresh_conviction,
+                no_research_coverage=conviction_now is None,
             )
         )
     session.flush()
@@ -486,6 +625,8 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
     running_cash = inputs.cash
     running_sector_pct = dict(sector_pct)
     running_cluster_pct = dict(cluster_pct)
+    running_sleeve_pct = dict(sleeve_pct)
+    open_speculative_slots = sum(1 for p in held_positions if p.sleeve == "SPECULATIVE")
 
     for scored in capped:
         screener_input = screener_inputs.get(scored.ticker)
@@ -497,20 +638,36 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
             logger.warning("price fetch failed for candidate ticker=%s error=%s", scored.ticker, exc)
             continue
 
+        candidate_sleeve = resolve_sleeve(scored.ticker, config.sleeves)
+        sleeve_defn = config.sleeves.definitions.get(candidate_sleeve)
+        room = sleeve_room(running_sleeve_pct.get(candidate_sleeve, 0.0), sleeve_defn) if sleeve_defn else None
+
         sector = gateway.get_sector(scored.ticker)
         cluster = gateway.get_cluster(scored.ticker)
-        sizing = size_new_position(
-            conviction_score=scored.conviction,
-            atr_pct_of_price=screener_input.technical.atr_pct_of_price,
-            nav_usd=nav.amount,  # risk_rules.py operates in plain USD floats — explicit unwrap, not implicit
-            sector=sector,
-            cluster=cluster,
-            current_sector_pct=running_sector_pct,
-            current_cluster_pct=running_cluster_pct,
-            cash_available_usd=running_cash.amount,
-            scaling=config.conviction_scaling,
-            config=config.risk,
-        )
+
+        if candidate_sleeve == "SPECULATIVE":
+            sizing = size_speculative_position(
+                nav_usd=nav.amount,
+                cash_available_usd=running_cash.amount,
+                sleeve_room=room if room is not None else 0.0,
+                open_speculative_slots=open_speculative_slots,
+                sleeve_config=sleeve_defn,
+                config=config.risk,
+            )
+        else:
+            sizing = size_new_position(
+                conviction_score=scored.conviction,
+                atr_pct_of_price=screener_input.technical.atr_pct_of_price,
+                nav_usd=nav.amount,  # risk_rules.py operates in plain USD floats — explicit unwrap, not implicit
+                sector=sector,
+                cluster=cluster,
+                current_sector_pct=running_sector_pct,
+                current_cluster_pct=running_cluster_pct,
+                cash_available_usd=running_cash.amount,
+                scaling=config.conviction_scaling,
+                config=config.risk,
+                sleeve_room=room,
+            )
         if not sizing.approved:
             session.add(RiskEvent(run_id=run_row.id, type="SIZING_REJECTED", detail_json=json.dumps({"ticker": scored.ticker, "reasons": sizing.reasons})))
             continue
@@ -518,12 +675,23 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
         order = build_buy_order(scored.ticker, scored.conviction, sizing, current_price, config.order_builder)
         if order is None:
             continue
+
+        speculative_warning: list[str] = []
+        if candidate_sleeve == "SWING":
+            speculative_warning = speculative_look_reasons(
+                market_cap_usd=screener_input.market_cap_usd,
+                free_cash_flow=screener_input.free_cash_flow,
+                trailing_pe=screener_input.trailing_pe,
+                config=config.speculative_look,
+            )
+
         memo = memo_by_ticker.get(scored.ticker)
         action_items.append(
             ActionItem(
                 order=order, headline="New position",
                 thesis_summary=getattr(memo, "thesis_summary", None),
                 bear_case=getattr(getattr(memo, "bear_case", None), "thesis", None),
+                speculative_warning=speculative_warning,
             )
         )
         session.add(
@@ -533,6 +701,7 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
                 conviction=order.conviction, rationale=getattr(memo, "thesis_summary", "") or "",
                 risk_checks_json=json.dumps(sizing.reasons), trigger_type=None, status="proposed",
                 created_at=inputs.as_of,
+                speculative_warning_json=json.dumps(speculative_warning) if speculative_warning else None,
             )
         )
 
@@ -541,6 +710,9 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
             running_sector_pct[sector] = running_sector_pct.get(sector, 0.0) + order.weight_pct
         if cluster:
             running_cluster_pct[cluster] = running_cluster_pct.get(cluster, 0.0) + order.weight_pct
+        running_sleeve_pct[candidate_sleeve] = running_sleeve_pct.get(candidate_sleeve, 0.0) + order.weight_pct
+        if candidate_sleeve == "SPECULATIVE":
+            open_speculative_slots += 1
     session.flush()
 
     # -------------------------------------------------------------- Watching
@@ -550,20 +722,69 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row) -> 
         generated_at=inputs.as_of,
         actions_today=action_items,
         watching=watching,
-        overnight_changes=_overnight_changes(stage2_results, held_set),
+        overnight_changes=_overnight_changes(digests_by_ticker, held_set),
         book=book_entries,
         portfolio_health=PortfolioHealth(
+            sleeve_weights_pct=sleeve_pct,
+            sleeve_targets_pct={name: defn.target_pct for name, defn in config.sleeves.definitions.items()},
             correlated_cluster_pct=cluster_pct,
             cash_pct=(inputs.cash / nav * 100) if nav.amount else 0.0,
             drawdown_from_peak_pct=nav_status.drawdown_pct,
             kill_switch=kill_status,
+            sleeve_band_breaches=sleeve_band_breaches,
         ),
-        drift=portfolio.check_drift(as_of=inputs.as_of),
         unresearched_holdings=[
             UnresearchedHolding(ticker=t, reason=r) for t, r in research_gap_reason.items() if t in held_set
         ],
     )
     return briefing
+
+
+@dataclass
+class StaleConviction:
+    score: float
+    run_id: int
+    started_at: dt.datetime
+
+
+def latest_conviction(session: Session, ticker: str, before_run_id: int) -> StaleConviction | None:
+    """The most recent real conviction score for a ticker from an earlier
+    run, with its provenance — what a held position is judged on between
+    refreshes. None if it has never been researched."""
+    row = session.execute(
+        select(ConvictionRow, Run.started_at)
+        .join(Run, Run.id == ConvictionRow.run_id)
+        .where(ConvictionRow.ticker == ticker, ConvictionRow.run_id < before_run_id)
+        .order_by(Run.started_at.desc(), ConvictionRow.id.desc())
+        .limit(1)
+    ).first()
+    if row is None:
+        return None
+    conviction, started_at = row
+    return StaleConviction(score=conviction.score, run_id=conviction.run_id, started_at=started_at)
+
+
+def holdings_due_for_refresh(session: Session, held_tickers: list[str], run_id: int, refresh_days: int) -> set[str]:
+    """Which held names get a fresh memo this run: every one with no memo on
+    record, plus the ceil(held / refresh_days) with the oldest memo — so the
+    whole book cycles through a refresh about every `refresh_days`, at a
+    flat daily cost instead of a spike. refresh_days <= 0 means all, daily."""
+    if not held_tickers:
+        return set()
+    if refresh_days <= 0:
+        return set(held_tickers)
+    last_seen: dict[str, dt.datetime] = {}
+    for ticker, started_at in session.execute(
+        select(ResearchOutput.ticker, Run.started_at)
+        .join(Run, Run.id == ResearchOutput.run_id)
+        .where(ResearchOutput.ticker.in_(held_tickers), ResearchOutput.run_id < run_id)
+    ):
+        if ticker not in last_seen or started_at > last_seen[ticker]:
+            last_seen[ticker] = started_at
+    never = {t for t in held_tickers if t not in last_seen}
+    per_run = -(-len(held_tickers) // refresh_days)
+    oldest = sorted((t for t in held_tickers if t in last_seen), key=lambda t: last_seen[t])[:per_run]
+    return never | set(oldest)
 
 
 def _distance_to_stop_pct(evaluation, current_price: float) -> float | None:
@@ -575,12 +796,19 @@ def _distance_to_stop_pct(evaluation, current_price: float) -> float | None:
     return None
 
 
-def _overnight_changes(stage2_results, held_set: set[str]) -> list[OvernightChange]:
-    return [
-        OvernightChange(ticker=r.ticker, summary=r.verdict)
-        for r in stage2_results
-        if r.ticker in held_set and r.material and r.verdict
-    ]
+def _overnight_changes(digests_by_ticker: dict[str, NewsDigest], held_set: set[str]) -> list[OvernightChange]:
+    """§3's "Overnight changes", held names only, and only from a digest
+    that found dated, cited news — `found_news` requires at least one
+    citation URL, and the URLs are appended so the reader can check the
+    claim. Nothing unsourced is ever shown here."""
+    changes: list[OvernightChange] = []
+    for ticker in sorted(held_set):
+        digest = digests_by_ticker.get(ticker)
+        if digest is None or not digest.found_news:
+            continue
+        summary = f"{digest.text} Sources: {', '.join(digest.source_urls)}"
+        changes.append(OvernightChange(ticker=ticker, summary=summary))
+    return changes
 
 
 def _build_watchlist(stage1_by_ticker, screener_inputs, held_set, config, run_row, session) -> list[BriefingWatchlistItem]:
@@ -597,9 +825,13 @@ def _build_watchlist(stage1_by_ticker, screener_inputs, held_set, config, run_ro
         if ticker in held_set or result.passed:
             continue
         if result.rank_score is not None and result.rank_score > 0:
-            item = BriefingWatchlistItem(ticker=ticker, reason="near Stage 1 cutoff", distance_to_trigger_pct=result.rank_score)
-            items.append(item)
-            session.add(WatchlistItemRow(run_id=run_row.id, ticker=ticker, reason=item.reason, distance_to_trigger=result.rank_score))
+            items.append(BriefingWatchlistItem(ticker=ticker, reason="near Stage 1 cutoff", distance_to_trigger_pct=result.rank_score))
+    # Closest to firing first, capped (config.briefing.watching_max_items):
+    # only the kept names are persisted, so the table matches the briefing.
+    items.sort(key=lambda i: (i.distance_to_trigger_pct if i.distance_to_trigger_pct is not None else float("inf"), i.ticker))
+    items = items[: max(0, config.briefing.watching_max_items)]
+    for item in items:
+        session.add(WatchlistItemRow(run_id=run_row.id, ticker=item.ticker, reason=item.reason, distance_to_trigger=item.distance_to_trigger_pct))
     session.flush()
     return items
 

@@ -6,6 +6,7 @@ test_order_builder.py / test_briefing.py already).
 """
 
 import datetime as dt
+from core.briefing import render_briefing_text
 import json
 
 import pytest
@@ -21,6 +22,7 @@ from core.config import (
     ScreenerConfig,
     Stage1Config,
     Stage2Config,
+    ResearchConfig,
 )
 from core.llm import LLMClient, MonthlySpendTracker
 from core.models import Candidate, Conviction, NavSnapshot, Proposal, ResearchOutput, Run
@@ -28,7 +30,8 @@ from core.money import usd
 from core.config import UniverseConfig, WeeklyWideScanConfig
 from core.orchestrator import NightlyRunInputs, build_universe, resolve_universe, rotating_slice, run_nightly
 from sources.prices import TechnicalSnapshot
-from tests.test_llm import FakeClient, FakeResponse
+from tests.test_llm import FakeCitation, FakeClient, FakeResponse, FakeTextBlock, FakeTextResponse
+from agents.screener import Stage2Ranking, Stage2Score
 
 CONVICTION_WEIGHTS = {
     "business_quality": 0.15,
@@ -115,7 +118,15 @@ def make_config() -> Config:
         risk=RiskConfig(),
         conviction_scaling=ConvictionScalingConfig(),
         order_builder=OrderBuilderConfig(),
+        # Off here so the scripted-LLM tests below need no digest responses;
+        # test_end_to_end turns it on and scripts the extra calls explicitly.
+        research=ResearchConfig(web_search_enabled=False),
     )
+
+
+def ranking(*pairs):
+    """One batched Stage 2 reply: (ticker, score) pairs. Held names never reach Stage 2."""
+    return FakeResponse(parsed_output=Stage2Ranking(items=[Stage2Score(ticker=t, score=sc, reason=f"{t} ranked") for t, sc in pairs]))
 
 
 def make_llm(tmp_path, script):
@@ -186,6 +197,79 @@ class TestResolveUniverse:
         assert len(result) == 10
 
 
+    def test_scan_size_zero_means_the_whole_pool_every_day(self):
+        pool = [f"T{i}" for i in range(50)]
+        config = UniverseConfig(watchlist=[], rotating_scan_size=0)
+        result = resolve_universe(held_tickers=["HELD1"], pool=pool, config=config, as_of=dt.datetime(2026, 8, 25))
+        assert set(result) == set(pool) | {"HELD1"}
+
+    def test_extra_tickers_join_the_pool(self):
+        pool = [f"T{i}" for i in range(50)]
+        config = UniverseConfig(watchlist=[], rotating_scan_size=0, extra_tickers=["nbis", "RKLB"])
+        result = resolve_universe(held_tickers=[], pool=pool, config=config, as_of=dt.datetime(2026, 8, 25))
+        assert "NBIS" in result and "RKLB" in result
+        assert len(result) == 52
+
+    def test_extra_tickers_are_included_even_when_rotating(self):
+        # A name you asked for by hand is not subject to the rotation — it is
+        # scanned every day, like the watchlist.
+        pool = [f"T{i}" for i in range(50)]
+        config = UniverseConfig(watchlist=[], rotating_scan_size=5, extra_tickers=["NBIS"])
+        result = resolve_universe(held_tickers=[], pool=pool, config=config, as_of=dt.datetime(2026, 8, 25))
+        assert "NBIS" in result
+        assert len(result) == 6
+
+
+class TestSleeveWiring:
+    def test_core_position_produces_no_exit_trigger_even_with_bad_conviction(self, session, portfolio, tmp_path):
+        # VTI resolves to CORE via config defaults — a conviction floor / thesis
+        # decay / trailing stop that would fire on SWING must not fire here.
+        portfolio.add_manual_position("VTI", qty=10, avg_cost=400.0, opened_at=dt.datetime(2026, 7, 1), conviction_at_entry=90.0)
+        inputs_by_ticker = {
+            "VTI": screener_input("VTI", is_held=True, technical=technical(atr_14=1.0)),
+        }
+        gateway = FakeGateway(inputs=inputs_by_ticker, prices={"VTI": 300.0})  # -25% from cost, conviction about to crater
+        script = [FakeResponse(parsed_output=memo(subscore=5.0, thesis_summary="VTI thesis gutted"))]
+        llm = make_llm(tmp_path, script)
+        config = make_config()
+        run_inputs = NightlyRunInputs(
+            as_of=dt.datetime(2026, 9, 1), universe_tickers=["VTI"], held_tickers=["VTI"], cash=usd(1_000.0)
+        )
+        briefing = run_nightly(session=session, portfolio=portfolio, gateway=gateway, llm=llm, config=config, inputs=run_inputs)
+        vti_entry = next(b for b in briefing.book if b.ticker == "VTI")
+        assert vti_entry.has_exit_trigger is False
+
+    def test_swing_position_still_triggers_conviction_floor(self, session, portfolio, tmp_path):
+        portfolio.add_manual_position("NVDA", qty=10, avg_cost=400.0, opened_at=dt.datetime(2026, 7, 1), conviction_at_entry=90.0)
+        inputs_by_ticker = {"NVDA": screener_input("NVDA", is_held=True, technical=technical(atr_14=1.0))}
+        gateway = FakeGateway(inputs=inputs_by_ticker, prices={"NVDA": 500.0})
+        script = [FakeResponse(parsed_output=memo(subscore=5.0, thesis_summary="NVDA thesis gutted"))]
+        llm = make_llm(tmp_path, script)
+        config = make_config()
+        run_inputs = NightlyRunInputs(
+            as_of=dt.datetime(2026, 9, 1), universe_tickers=["NVDA"], held_tickers=["NVDA"], cash=usd(1_000.0)
+        )
+        briefing = run_nightly(session=session, portfolio=portfolio, gateway=gateway, llm=llm, config=config, inputs=run_inputs)
+        nvda_entry = next(b for b in briefing.book if b.ticker == "NVDA")
+        assert nvda_entry.has_exit_trigger is True
+
+    def test_portfolio_health_carries_sleeve_weights(self, session, portfolio, tmp_path):
+        portfolio.add_manual_position("VTI", qty=10, avg_cost=400.0, opened_at=dt.datetime(2026, 7, 1))
+        inputs_by_ticker = {"VTI": screener_input("VTI", is_held=True, technical=technical(atr_14=1.0))}
+        gateway = FakeGateway(inputs=inputs_by_ticker, prices={"VTI": 400.0})
+        script = [FakeResponse(parsed_output=memo(subscore=60.0))]
+        llm = make_llm(tmp_path, script)
+        config = make_config()
+        run_inputs = NightlyRunInputs(
+            as_of=dt.datetime(2026, 9, 1), universe_tickers=["VTI"], held_tickers=["VTI"], cash=usd(3_000.0)
+        )
+        briefing = run_nightly(session=session, portfolio=portfolio, gateway=gateway, llm=llm, config=config, inputs=run_inputs)
+        assert "CORE" in briefing.portfolio_health.sleeve_weights_pct
+        assert briefing.portfolio_health.sleeve_targets_pct["CORE"] == 50
+        # VTI 10*$400=$4,000 of $7,000 NAV = ~57.1%
+        assert briefing.portfolio_health.sleeve_weights_pct["CORE"] == pytest.approx(57.14, abs=0.1)
+
+
 class TestFullNightlyRun:
     def test_end_to_end(self, session, portfolio, tmp_path):
         # --- held position, matching §3's NBIS example
@@ -208,16 +292,19 @@ class TestFullNightlyRun:
 
         # call order: stage2 triage for stage1 survivors [NBIS(held), AMD, NVDA] (BADCO fails stage1, no call)
         # then research for stage2 survivors [NBIS(held, always), AMD(material)]
+        # then a web-search news digest per stage2 survivor, then research memos
         script = [
-            FakeResponse(parsed_output=Stage2Verdict(verdict="Guidance raised for FY", material=True)),  # NBIS
-            FakeResponse(parsed_output=Stage2Verdict(verdict="New contract win", material=True)),  # AMD
-            FakeResponse(parsed_output=Stage2Verdict(verdict="Nothing material", material=False)),  # NVDA
+            ranking(("AMD", 85), ("NVDA", 30)),  # one batched Stage 2 call over the non-held survivors; NBIS (held) skips it
+            FakeTextResponse([FakeTextBlock("2026-08-24: NBIS raised FY guidance.", [FakeCitation("https://example.com/nbis")])], web_search_requests=1),  # NBIS digest
+            FakeTextResponse([FakeTextBlock("NO_MATERIAL_NEWS")]),  # AMD digest: nothing sourced
             FakeResponse(parsed_output=memo(subscore=40.0, thesis_summary="NBIS thesis decaying")),  # NBIS research
             FakeResponse(parsed_output=memo(subscore=80.0, thesis_summary="AMD strong thesis")),  # AMD research
         ]
         llm = make_llm(tmp_path, script)
 
         config = make_config()
+        config.research = ResearchConfig(web_search_enabled=True)
+        config.screener.stage2 = Stage2Config(max_survivors=1)  # only the top-ranked new name gets a memo
         # NBIS position value (8 * $222 = $1,776) + this cash figure = $100,000 NAV,
         # chosen to keep the sizing math identical to the previous fixed-NAV test.
         run_inputs = NightlyRunInputs(
@@ -241,6 +328,7 @@ class TestFullNightlyRun:
         assert candidates["NVDA"].stage1_passed is True
         assert candidates["NVDA"].stage2_passed is False
         assert candidates["NVDA"].stage2_material is False
+        assert candidates["AMD"].stage2_verdict == "AMD ranked"
 
         # --- only material, non-dropped names got a research memo
         research_tickers = {r.ticker for r in session.execute(select(ResearchOutput)).scalars()}
@@ -267,9 +355,16 @@ class TestFullNightlyRun:
         # --- briefing: watching surfaces the stage1 near-miss, not the stage2 drop
         assert [w.ticker for w in briefing.watching] == ["BADCO"]
 
-        # --- briefing: overnight changes only for held + material (NBIS, not AMD)
+        # --- briefing: overnight changes come from the sourced web-search digest,
+        # held names only (NBIS), never from Stage 2's from-memory verdict
         assert [c.ticker for c in briefing.overnight_changes] == ["NBIS"]
-        assert briefing.overnight_changes[0].summary == "Guidance raised for FY"
+        assert "raised FY guidance" in briefing.overnight_changes[0].summary
+        assert "https://example.com/nbis" in briefing.overnight_changes[0].summary
+        assert "Guidance raised for FY" not in briefing.overnight_changes[0].summary
+
+        # --- the digest and its sources are persisted with the memo
+        nbis_output = next(r for r in session.execute(select(ResearchOutput)).scalars() if r.ticker == "NBIS")
+        assert json.loads(nbis_output.reasoning_json)["news_sources"] == ["https://example.com/nbis"]
 
         # --- briefing: book has the one held position, flagged for attention
         assert [b.ticker for b in briefing.book] == ["NBIS"]
@@ -294,6 +389,20 @@ class TestFullNightlyRun:
         assert stored["book"][0]["ticker"] == "NBIS"
         assert stored["actions_today"][0]["order"]["ticker"] == "AMD"
 
+    def test_gateway_prefetch_is_called_with_the_universe_before_stage1(self, session, portfolio, tmp_path):
+        portfolio.add_manual_position("NBIS", qty=8, avg_cost=218.0, opened_at=dt.datetime(2026, 7, 1), conviction_at_entry=68.0)
+        calls = []
+
+        class PrefetchingGateway(FakeGateway):
+            def prefetch(self, tickers):
+                calls.append(list(tickers))
+
+        gateway = PrefetchingGateway(inputs={"NBIS": screener_input("NBIS", is_held=True)}, prices={"NBIS": 222.0})
+        llm = make_llm(tmp_path, [FakeResponse(parsed_output=memo())])
+        run_inputs = NightlyRunInputs(as_of=dt.datetime(2026, 8, 25, 22), universe_tickers=["NBIS"], held_tickers=["NBIS"], cash=usd(1000.0))
+        run_nightly(session=session, config=make_config(), gateway=gateway, llm=llm, portfolio=portfolio, inputs=run_inputs)
+        assert calls == [["NBIS"]]
+
     def test_kill_switch_blocks_new_buys_but_not_exits(self, session, portfolio, tmp_path):
         portfolio.add_manual_position("NBIS", qty=8, avg_cost=218.0, opened_at=dt.datetime(2026, 7, 1), conviction_at_entry=68.0)
 
@@ -313,8 +422,7 @@ class TestFullNightlyRun:
         }
         gateway = FakeGateway(inputs=inputs_by_ticker, prices={"NBIS": 222.0, "AMD": 150.0})
         script = [
-            FakeResponse(parsed_output=Stage2Verdict(verdict="x", material=True)),  # NBIS
-            FakeResponse(parsed_output=Stage2Verdict(verdict="y", material=True)),  # AMD
+            ranking(("AMD", 90)),
             FakeResponse(parsed_output=memo(subscore=40.0)),  # NBIS research
             FakeResponse(parsed_output=memo(subscore=80.0)),  # AMD research
         ]
@@ -349,8 +457,7 @@ class TestFullNightlyRun:
             inputs=inputs_by_ticker, prices={"AMD": 150.0, "NVDA": 100.0}, context_failures={"AMD"}
         )
         script = [
-            FakeResponse(parsed_output=Stage2Verdict(verdict="a", material=True)),  # AMD
-            FakeResponse(parsed_output=Stage2Verdict(verdict="b", material=True)),  # NVDA
+            ranking(("AMD", 90), ("NVDA", 80)),
             FakeResponse(parsed_output=memo(subscore=80.0)),  # NVDA research (AMD's context fetch failed first)
         ]
         llm = make_llm(tmp_path, script)
@@ -421,7 +528,6 @@ class TestPricingGate:
         inputs_by_ticker = {"NBIS": screener_input("NBIS", is_held=True)}
         gateway = FakeGateway(inputs=inputs_by_ticker, prices={"NBIS": 222.0})
         script = [
-            FakeResponse(parsed_output=Stage2Verdict(verdict="x", material=False)),
             FakeResponse(parsed_output=memo(subscore=50.0)),
         ]
         llm = make_llm(tmp_path, script)
@@ -445,7 +551,6 @@ class TestPricingGate:
 
         gateway = FakeGateway(inputs={"AMD": screener_input("AMD", is_held=True)}, prices={"AMD": 150.0})
         script = [
-            FakeResponse(parsed_output=Stage2Verdict(verdict="x", material=False)),
             FakeResponse(parsed_output=memo(subscore=50.0)),
         ]
         llm = make_llm(tmp_path, script)
@@ -498,7 +603,7 @@ class TestUnresearchedHoldings:
             prices={"NBIS": 200.0},
             context_failures={"NBIS"},
         )
-        script = [FakeResponse(parsed_output=Stage2Verdict(verdict="x", material=False))]
+        script = []
         llm = make_llm(tmp_path, script)
         config = make_config()
         run_inputs = NightlyRunInputs(
@@ -519,7 +624,6 @@ class TestUnresearchedHoldings:
         portfolio.add_manual_position("NBIS", qty=4, avg_cost=192.0, conviction_at_entry=68.0)
         gateway = FakeGateway(inputs={"NBIS": screener_input("NBIS", is_held=True)}, prices={"NBIS": 200.0})
         script = [
-            FakeResponse(parsed_output=Stage2Verdict(verdict="x", material=False)),
             FakeResponse(parsed_output=memo(subscore=60.0)),
         ]
         llm = make_llm(tmp_path, script)
@@ -539,44 +643,80 @@ class TestUnresearchedHoldings:
 
 class TestConvictionFloorIntegration:
     def test_low_conviction_held_position_gets_an_exit_proposal(self, session, portfolio, tmp_path):
-        # reproduces the exact live-run gap: RKLB, no entry baseline, price
-        # essentially flat since purchase — nothing else would ever fire
-        portfolio.add_manual_position("RKLB", qty=3, avg_cost=120.0, conviction_at_entry=None)
+        # reproduces the exact live-run gap: a held position, no entry
+        # baseline, price essentially flat since purchase — nothing else
+        # would ever fire. Originally written against RKLB; moved to MRVL
+        # (still SWING under the sleeve architecture) once RKLB became a
+        # config-listed SPECULATIVE ticker — SPECULATIVE deliberately has no
+        # conviction-floor safety net at all (see TestSpeculativeSleeveHasNoConvictionFloorSafetyNet
+        # below), so this SWING-only regression needs a SWING ticker to still
+        # mean what it originally meant.
+        portfolio.add_manual_position("MRVL", qty=3, avg_cost=120.0, conviction_at_entry=None)
         gateway = FakeGateway(
-            inputs={"RKLB": screener_input("RKLB", technical=technical(atr_14=2.0))},
-            prices={"RKLB": 122.0},  # up slightly, nowhere near a profit band
+            inputs={"MRVL": screener_input("MRVL", technical=technical(atr_14=2.0))},
+            prices={"MRVL": 122.0},  # up slightly, nowhere near a profit band
         )
         script = [
-            FakeResponse(parsed_output=Stage2Verdict(verdict="weak", material=True)),
+            ranking(("MRVL", 30)),
             FakeResponse(parsed_output=memo(subscore=36.4, thesis_summary="accelerating cash burn")),
         ]
         llm = make_llm(tmp_path, script)
         config = make_config()
         run_inputs = NightlyRunInputs(
             as_of=dt.datetime(2026, 8, 25, 22, 0, 0),
-            universe_tickers=build_universe(held_tickers=["RKLB"], watchlist=[], scan_tickers=[]),
-            held_tickers=["RKLB"],
+            universe_tickers=build_universe(held_tickers=["MRVL"], watchlist=[], scan_tickers=[]),
+            held_tickers=["MRVL"],
             cash=usd(100.0),
         )
 
         briefing = run_nightly(session=session, config=config, gateway=gateway, llm=llm, portfolio=portfolio, inputs=run_inputs)
 
         proposals = {p.ticker: p for p in session.execute(select(Proposal)).scalars()}
-        assert "RKLB" in proposals
-        assert proposals["RKLB"].action == "SELL"
-        assert proposals["RKLB"].trigger_type == "CONVICTION_FLOOR"
-        assert [a.order.ticker for a in briefing.actions_today] == ["RKLB"]
+        assert "MRVL" in proposals
+        assert proposals["MRVL"].action == "SELL"
+        assert proposals["MRVL"].trigger_type == "CONVICTION_FLOOR"
+        assert [a.order.ticker for a in briefing.actions_today] == ["MRVL"]
         assert briefing.actions_today[0].headline.startswith("Conviction below floor")
 
     def test_conviction_at_or_above_floor_gets_no_proposal(self, session, portfolio, tmp_path):
+        portfolio.add_manual_position("MRVL", qty=3, avg_cost=120.0, conviction_at_entry=None)
+        gateway = FakeGateway(
+            inputs={"MRVL": screener_input("MRVL", technical=technical(atr_14=2.0))},
+            prices={"MRVL": 122.0},
+        )
+        script = [
+            ranking(("MRVL", 60)),
+            FakeResponse(parsed_output=memo(subscore=40.0)),  # exactly at the floor
+        ]
+        llm = make_llm(tmp_path, script)
+        config = make_config()
+        run_inputs = NightlyRunInputs(
+            as_of=dt.datetime(2026, 8, 25, 22, 0, 0),
+            universe_tickers=build_universe(held_tickers=["MRVL"], watchlist=[], scan_tickers=[]),
+            held_tickers=["MRVL"],
+            cash=usd(100.0),
+        )
+
+        briefing = run_nightly(session=session, config=config, gateway=gateway, llm=llm, portfolio=portfolio, inputs=run_inputs)
+
+        assert briefing.actions_today == []
+
+    def test_speculative_sleeve_has_no_conviction_floor_safety_net(self, session, portfolio, tmp_path):
+        # The same real-world gap as above (RKLB, no entry baseline, flat
+        # price, decaying conviction) — but RKLB now resolves to SPECULATIVE
+        # (config.yaml's sleeve ticker list), and SPECULATIVE deliberately
+        # trades the conviction-floor safety net for a -60% hard stop
+        # instead (user-approved design). This is the documented tradeoff,
+        # not a bug: a SPECULATIVE holding can sit at low conviction
+        # indefinitely unless it also crosses the hard stop.
         portfolio.add_manual_position("RKLB", qty=3, avg_cost=120.0, conviction_at_entry=None)
         gateway = FakeGateway(
             inputs={"RKLB": screener_input("RKLB", technical=technical(atr_14=2.0))},
             prices={"RKLB": 122.0},
         )
         script = [
-            FakeResponse(parsed_output=Stage2Verdict(verdict="ok", material=True)),
-            FakeResponse(parsed_output=memo(subscore=40.0)),  # exactly at the floor
+            ranking(("RKLB", 30)),
+            FakeResponse(parsed_output=memo(subscore=36.4, thesis_summary="accelerating cash burn")),
         ]
         llm = make_llm(tmp_path, script)
         config = make_config()
@@ -603,7 +743,6 @@ class TestEtfExemption:
             prices={"VGT": 117.0},
         )
         script = [
-            FakeResponse(parsed_output=Stage2Verdict(verdict="etf, no news", material=False)),
             FakeResponse(parsed_output=memo(subscore=55.0)),
         ]
         llm = make_llm(tmp_path, script)
@@ -627,7 +766,6 @@ class TestUnavailableFactorsPersistence:
         portfolio.add_manual_position("NBIS", qty=4, avg_cost=192.0, conviction_at_entry=68.0)
         gateway = FakeGateway(inputs={"NBIS": screener_input("NBIS", is_held=True)}, prices={"NBIS": 200.0})
         script = [
-            FakeResponse(parsed_output=Stage2Verdict(verdict="x", material=False)),
             FakeResponse(parsed_output=memo(subscore=60.0, ownership_flow=None, catalyst_path=None)),
         ]
         llm = make_llm(tmp_path, script)
@@ -647,3 +785,117 @@ class TestUnavailableFactorsPersistence:
         subscores = json.loads(research_output.subscores_json)
         assert "ownership_flow" not in subscores
         assert "catalyst_path" not in subscores
+
+
+class TestHoldingsCadenceAndNoFabricatedScores:
+    def _seed_prior_run(self, session, days_ago: dict, scores: dict, as_of):
+        """A finished earlier run with a memo + conviction per ticker, dated per `days_ago`."""
+        from core.models import Conviction as ConvictionRow, ResearchOutput
+        import json as _json
+
+        ids = {}
+        for ticker, age in days_ago.items():
+            at = as_of - dt.timedelta(days=age)
+            run = Run(started_at=at, finished_at=at, status="succeeded", config_snapshot_json="{}")
+            session.add(run)
+            session.flush()
+            session.add(ResearchOutput(run_id=run.id, ticker=ticker, subscores_json="{}", reasoning_json="{}", consensus_view="c", variant_view="v", bear_case_json="{}", catalysts_json="[]", risks_json="[]", thesis_summary="t", model="m"))
+            session.add(ConvictionRow(run_id=run.id, ticker=ticker, score=scores[ticker], weights_snapshot_json="{}", derivation_json="{}"))
+            ids[ticker] = run.id
+        session.flush()
+        return ids
+
+    def test_only_the_oldest_holdings_are_refreshed_and_the_rest_reuse_their_last_real_score(self, session, portfolio, tmp_path):
+        as_of = dt.datetime(2026, 8, 25, 22)
+        portfolio.add_manual_position("NBIS", qty=8, avg_cost=218.0, opened_at=dt.datetime(2026, 7, 1))
+        portfolio.add_manual_position("AMD", qty=3, avg_cost=150.0, opened_at=dt.datetime(2026, 7, 1))
+        ids = self._seed_prior_run(session, {"NBIS": 3, "AMD": 1}, {"NBIS": 61.0, "AMD": 72.0}, as_of)
+        gateway = FakeGateway(
+            inputs={"NBIS": screener_input("NBIS", is_held=True), "AMD": screener_input("AMD", is_held=True)},
+            prices={"NBIS": 222.0, "AMD": 150.0},
+        )
+        llm = make_llm(tmp_path, [FakeResponse(parsed_output=memo(subscore=58.0))])  # exactly one memo: NBIS, the oldest
+        config = make_config()
+        config.research = ResearchConfig(web_search_enabled=False, holdings_refresh_days=7)  # ceil(2/7) = 1 refresh per run
+        run_inputs = NightlyRunInputs(as_of=as_of, universe_tickers=["NBIS", "AMD"], held_tickers=["NBIS", "AMD"], cash=usd(1000.0))
+        briefing = run_nightly(session=session, config=config, gateway=gateway, llm=llm, portfolio=portfolio, inputs=run_inputs)
+
+        book = {b.ticker: b for b in briefing.book}
+        assert book["NBIS"].conviction_now == 58.0 and book["NBIS"].conviction_age_days is None  # fresh
+        assert book["AMD"].conviction_now == 72.0  # reused, real, from the run one day ago
+        assert book["AMD"].conviction_run_id == ids["AMD"] and book["AMD"].conviction_age_days == pytest.approx(1.0)
+        assert book["AMD"].no_research_coverage is False
+        assert briefing.unresearched_holdings == []  # a scheduled reuse is not a coverage gap
+        assert "from run" in render_briefing_text(briefing)
+
+    def test_never_researched_holding_with_a_failed_memo_gets_no_score_and_no_exit_order(self, session, portfolio, tmp_path):
+        # Price is far below the peak, which a fabricated 50 would have turned
+        # into a trailing-stop SELL (runs 1-7). With no score on record the
+        # position is reported as unmonitored and nothing is proposed.
+        portfolio.add_manual_position("NBIS", qty=8, avg_cost=218.0, opened_at=dt.datetime(2026, 7, 1))
+        pos = portfolio.list_positions()[0]
+        pos.peak_price_since_activation = 300.0
+        session.flush()
+        gateway = FakeGateway(inputs={"NBIS": screener_input("NBIS", is_held=True, technical=technical(atr_14=3.0))}, prices={"NBIS": 150.0})
+        llm = make_llm(tmp_path, [RuntimeError("credit balance too low")] * 3)
+        run_inputs = NightlyRunInputs(as_of=dt.datetime(2026, 8, 25, 22), universe_tickers=["NBIS"], held_tickers=["NBIS"], cash=usd(1000.0))
+        briefing = run_nightly(session=session, config=make_config(), gateway=gateway, llm=llm, portfolio=portfolio, inputs=run_inputs)
+
+        assert briefing.actions_today == []
+        assert briefing.book[0].conviction_now is None and briefing.book[0].no_research_coverage is True
+        assert [u.ticker for u in briefing.unresearched_holdings] == ["NBIS"]
+        assert session.execute(select(Proposal)).scalars().all() == []
+
+    def test_max_candidates_per_run_caps_new_memos(self, session, portfolio, tmp_path):
+        inputs = {t: screener_input(t, technical=technical(relative_strength_vs_spy_pct=r)) for t, r in (("A", 9), ("B", 8), ("C", 7))}
+        gateway = FakeGateway(inputs=inputs, prices={})
+        llm = make_llm(tmp_path, [ranking(("A", 90), ("B", 80), ("C", 70)), FakeResponse(parsed_output=memo(subscore=70.0)), FakeResponse(parsed_output=memo(subscore=65.0))])
+        config = make_config()
+        config.research = ResearchConfig(web_search_enabled=False, max_candidates_per_run=2)
+        run_inputs = NightlyRunInputs(as_of=dt.datetime(2026, 8, 25, 22), universe_tickers=["A", "B", "C"], held_tickers=[], cash=usd(100_000.0))
+        run_nightly(session=session, config=config, gateway=gateway, llm=llm, portfolio=portfolio, inputs=run_inputs)
+        assert {r.ticker for r in session.execute(select(ResearchOutput)).scalars()} == {"A", "B"}
+        assert len(llm.client.messages.script) == 0  # every scripted response consumed, and no call for C
+
+
+class TestHoldingsDueForRefresh:
+    def test_never_researched_always_due_plus_oldest_slice(self, session):
+        from core.orchestrator import holdings_due_for_refresh
+        from core.models import ResearchOutput
+
+        as_of = dt.datetime(2026, 8, 25)
+        for i, (ticker, age) in enumerate((("OLD", 6), ("MID", 3), ("NEW", 1))):
+            at = as_of - dt.timedelta(days=age)
+            run = Run(started_at=at, finished_at=at, status="succeeded", config_snapshot_json="{}")
+            session.add(run)
+            session.flush()
+            session.add(ResearchOutput(run_id=run.id, ticker=ticker, subscores_json="{}", reasoning_json="{}", consensus_view="c", variant_view="v", bear_case_json="{}", catalysts_json="[]", risks_json="[]", thesis_summary="t", model="m"))
+        session.flush()
+        due = holdings_due_for_refresh(session, ["OLD", "MID", "NEW", "NEVER"], run_id=10**6, refresh_days=7)
+        assert due == {"NEVER", "OLD"}  # ceil(4/7) = 1 stale name per run, oldest first, plus the never-researched one
+
+    def test_refresh_days_zero_means_everything_daily(self, session):
+        from core.orchestrator import holdings_due_for_refresh
+
+        assert holdings_due_for_refresh(session, ["A", "B"], run_id=5, refresh_days=0) == {"A", "B"}
+
+
+class TestWatchingCap:
+    def test_watching_is_sorted_closest_first_and_capped(self, session, portfolio, tmp_path):
+        from core.config import BriefingConfig
+        from core.models import WatchlistItem as WatchlistItemRow
+
+        # Five near-misses (fail the market-cap floor, positive momentum), cap of 3.
+        inputs = {
+            t: screener_input(t, market_cap_usd=1_000, technical=technical(relative_strength_vs_spy_pct=d))
+            for t, d in (("FAR", 40.0), ("NEAR", 2.0), ("MID", 10.0), ("NEAREST", 0.5), ("FARTHEST", 90.0))
+        }
+        gateway = FakeGateway(inputs=inputs, prices={})
+        llm = make_llm(tmp_path, [])  # nothing passes Stage 1, so no LLM calls
+        config = make_config()
+        config.briefing = BriefingConfig(watching_max_items=3)
+        run_inputs = NightlyRunInputs(as_of=dt.datetime(2026, 8, 25, 22), universe_tickers=list(inputs), held_tickers=[], cash=usd(1000.0))
+        briefing = run_nightly(session=session, config=config, gateway=gateway, llm=llm, portfolio=portfolio, inputs=run_inputs)
+
+        assert [w.ticker for w in briefing.watching] == ["NEAREST", "NEAR", "MID"]
+        assert [r.ticker for r in session.execute(select(WatchlistItemRow)).scalars()] == ["NEAREST", "NEAR", "MID"]

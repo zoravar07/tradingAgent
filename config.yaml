@@ -100,12 +100,6 @@ order_builder:
   limit_buffer_pct: 0.5
   profit_trim_fraction: 0.5
 
-sleeves:                         # % of NAV
-  core_longterm: 35              # VTI, VGT, IAU — held, not actively traded
-  thematic: 45
-  tactical: 15
-  cash_buffer: 5
-
 risk:
   max_position_pct: 12
   max_sector_pct: 40

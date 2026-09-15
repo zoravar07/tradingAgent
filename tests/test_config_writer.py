@@ -99,3 +99,30 @@ class TestDefaultValues:
 
         defaults = default_values()
         assert defaults["risk"]["max_position_pct"] == RiskConfig().max_position_pct
+
+
+class TestRealConfigYamlLoads:
+    """Regression test for a real incident: core/config.py's Config model
+    uses plain PyYAML (safe_load), which silently lets a later duplicate
+    top-level key win — but the Settings screen's read_raw/write_raw
+    (core/config_writer.py) uses ruamel.yaml for comment-preserving
+    round-trips, which raises DuplicateKeyError on the exact same file.
+    A change that only ran core.config.load_config against the real
+    config.yaml (as most manual checks do) would never have caught this —
+    the Settings screen returned a 500 in the browser instead. This test
+    exercises both loaders against the actual repo file, not a fixture."""
+
+    def _real_config_path(self):
+        from pathlib import Path
+
+        return Path(__file__).resolve().parent.parent / "config.yaml"
+
+    def test_ruamel_read_raw_accepts_the_real_file(self):
+        raw = read_raw(self._real_config_path())
+        assert "sleeves" in raw
+
+    def test_pydantic_load_config_accepts_the_real_file(self):
+        from core.config import load_config
+
+        config = load_config(self._real_config_path())
+        assert "CORE" in config.sleeves.definitions

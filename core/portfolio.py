@@ -3,7 +3,7 @@
 Owns Z Money's own `positions` table (the source of truth, per §2) and the three
 ways positions get into it:
 
-  1. `import_flex_csv`   — IBKR Flex Query "Open Positions" CSV, reconciled
+  1. `record_broker_sync` — IBKR Flex Web Service Open Positions + Cash Report (sources/ibkr_flex.py), reconciled
                             against the current book.
   2. `mark_filled`       — you placed an order manually in IBKR; tell Z Money
                             what actually filled and it updates its book.
@@ -33,10 +33,10 @@ Design notes that aren't obvious from the spec text alone:
   default (e.g. SGD), even when every position traded is USD. This bit a
   real user during development: they read "$53.21 excess liquidity" and
   "$15,523 market value" off the dashboard, both of which were actually the
-  SGD-denominated figures, not USD. `parse_flex_cash_balance` already
-  guards against this for CSV imports — it filters to `CurrencyPrimary ==
-  "USD"` rows before summing — but there is no equivalent guard for a
-  number a human transcribes by hand into `--cash` or a manual entry.
+  SGD-denominated figures, not USD. The Flex Web Service sync (sources/ibkr_flex.py) guards against this by
+  reading only the Cash Report's USD row and only USD-denominated equity
+  lines, and the manual `--cash` override that once bypassed that guard is
+  gone.
   Always ask "which currency is this figure actually in" before trusting a
   dashboard number, and see core/money.py for why NAV/cash are `Money`
   (currency-tagged), not bare floats, specifically at this boundary.
@@ -44,19 +44,18 @@ Design notes that aren't obvious from the spec text alone:
 
 from __future__ import annotations
 
-import csv
 import datetime as dt
-import io
 import json
 from dataclasses import dataclass, field
-from typing import IO, Literal
+from typing import Literal
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from core.config import PortfolioConfig
+from core.config import PortfolioConfig, SleevesConfig
 from core.models import Position, PositionImport
 from core.money import Money, usd
+from core.sleeves import resolve_sleeve
 
 # Reconciliation tolerances: Flex Query numbers are broker-rounded, so exact
 # equality is too strict. Quantities should match exactly for equities
@@ -66,22 +65,8 @@ QTY_TOLERANCE = 1e-6
 COST_ABS_TOLERANCE = 0.01
 COST_REL_TOLERANCE = 0.001
 
-# Candidate column names (case-insensitive) in an IBKR Flex Query "Open
-# Positions" export, in preference order. Flex Query field selection is
-# user-configurable, so exact headers vary — this list is a best-effort
-# mapping; if a real export doesn't parse, add its header spelling here.
-_TICKER_COLUMNS = ["Symbol", "Ticker"]
-_QTY_COLUMNS = ["Position", "Quantity", "Qty"]
-_COST_PRICE_COLUMNS = ["CostBasisPrice", "AvgCost", "AverageCost", "OpenPrice"]
-_COST_MONEY_COLUMNS = ["CostBasisMoney", "CostBasis"]
-_ASSET_CLASS_COLUMNS = ["AssetClass"]
-_EQUITY_ASSET_CLASSES = {"STK"}
-_CASH_ASSET_CLASSES = {"CASH"}
-_CURRENCY_COLUMNS = ["CurrencyPrimary", "Currency"]
-
-
 class ReconciliationError(ValueError):
-    """Raised when a Flex Query CSV can't be parsed into positions."""
+    """Raised when broker rows can't be reconciled into positions."""
 
 
 class PortfolioError(ValueError):
@@ -122,138 +107,15 @@ class ReconciliationResult:
         return counts
 
 
-@dataclass
-class DriftStatus:
-    stale: bool
-    last_import_at: dt.datetime | None
-    days_since_import: float | None
-    threshold_days: int
-
-
-def _normalize_headers(fieldnames: list[str]) -> dict[str, str]:
-    """Map lowercased header -> original header, for case-insensitive lookup."""
-    return {name.strip().lower(): name for name in fieldnames}
-
-
-def _find_column(header_map: dict[str, str], candidates: list[str]) -> str | None:
-    for candidate in candidates:
-        original = header_map.get(candidate.lower())
-        if original is not None:
-            return original
-    return None
-
-
-def parse_flex_csv(source: str | IO[str]) -> list[ImportedPosition]:
-    """Parse an IBKR Flex Query "Open Positions" CSV into normalized rows.
-
-    `source` is either CSV text or a file-like object opened in text mode.
-    Rows with zero quantity are skipped. If an AssetClass column is present,
-    only equities (STK — this covers both stocks and ETFs in IBKR's
-    classification) are kept; options/futures are out of scope until §9's
-    `options.enabled` flips on.
-    """
-    text = source.read() if hasattr(source, "read") else source
-    reader = csv.DictReader(io.StringIO(text))
-    if not reader.fieldnames:
-        raise ReconciliationError("CSV has no header row")
-
-    header_map = _normalize_headers(reader.fieldnames)
-    ticker_col = _find_column(header_map, _TICKER_COLUMNS)
-    qty_col = _find_column(header_map, _QTY_COLUMNS)
-    if ticker_col is None or qty_col is None:
-        raise ReconciliationError(
-            f"could not find ticker/quantity columns in header: {reader.fieldnames}"
-        )
-    cost_price_col = _find_column(header_map, _COST_PRICE_COLUMNS)
-    cost_money_col = _find_column(header_map, _COST_MONEY_COLUMNS)
-    asset_class_col = _find_column(header_map, _ASSET_CLASS_COLUMNS)
-
-    if cost_price_col is None and cost_money_col is None:
-        raise ReconciliationError(
-            f"could not find a cost basis column in header: {reader.fieldnames}"
-        )
-
-    out: list[ImportedPosition] = []
-    for row in reader:
-        if asset_class_col is not None:
-            asset_class = (row.get(asset_class_col) or "").strip().upper()
-            if asset_class and asset_class not in _EQUITY_ASSET_CLASSES:
-                continue
-
-        ticker = (row.get(ticker_col) or "").strip().upper()
-        if not ticker:
-            continue
-
-        try:
-            qty = float(row[qty_col])
-        except (TypeError, ValueError) as exc:
-            raise ReconciliationError(f"bad quantity for {ticker!r}: {row.get(qty_col)!r}") from exc
-        if qty == 0:
-            continue
-
-        avg_cost = None
-        if cost_price_col is not None and (row.get(cost_price_col) or "").strip():
-            avg_cost = float(row[cost_price_col])
-        elif cost_money_col is not None and (row.get(cost_money_col) or "").strip():
-            avg_cost = float(row[cost_money_col]) / qty
-        if avg_cost is None:
-            raise ReconciliationError(f"no usable cost basis for {ticker!r}")
-
-        out.append(ImportedPosition(ticker=ticker, qty=qty, avg_cost=avg_cost))
-
-    return out
-
-
-def parse_flex_cash_balance(source: str | IO[str]) -> Money | None:
-    """Sums CASH-classified rows' Position value from an IBKR Flex Query
-    export — added for core/nav.py's NAV calculation, on top of §2's
-    original CSV parsing which only cared about equities.
-
-    USD-only: a CurrencyPrimary column, if present, filters to USD rows
-    only — this is what protects an import from the base-currency trap
-    (module docstring) that bit a manually-entered figure. A multi-currency
-    account needs this extended — a documented gap, not a silent one.
-    Returns None (not $0) when the balance can't be determined at all — the
-    caller must not confuse "no cash data in this export" with "zero cash"."""
-    text = source.read() if hasattr(source, "read") else source
-    reader = csv.DictReader(io.StringIO(text))
-    if not reader.fieldnames:
-        return None
-
-    header_map = _normalize_headers(reader.fieldnames)
-    asset_class_col = _find_column(header_map, _ASSET_CLASS_COLUMNS)
-    qty_col = _find_column(header_map, _QTY_COLUMNS)
-    if asset_class_col is None or qty_col is None:
-        return None
-    currency_col = _find_column(header_map, _CURRENCY_COLUMNS)
-
-    total = 0.0
-    found = False
-    for row in reader:
-        asset_class = (row.get(asset_class_col) or "").strip().upper()
-        if asset_class not in _CASH_ASSET_CLASSES:
-            continue
-        if currency_col is not None:
-            currency = (row.get(currency_col) or "").strip().upper()
-            if currency and currency != "USD":
-                continue
-        try:
-            total += float(row[qty_col])
-            found = True
-        except (TypeError, ValueError):
-            continue
-
-    return usd(total) if found else None
-
-
 def _costs_match(a: float, b: float) -> bool:
     return abs(a - b) <= max(COST_ABS_TOLERANCE, COST_REL_TOLERANCE * max(abs(a), abs(b)))
 
 
 class PortfolioService:
-    def __init__(self, session: Session, config: PortfolioConfig | None = None):
+    def __init__(self, session: Session, config: PortfolioConfig | None = None, sleeves: SleevesConfig | None = None):
         self.session = session
         self.config = config or PortfolioConfig()
+        self.sleeves = sleeves or SleevesConfig()
 
     # ---------------------------------------------------------------- reads
 
@@ -298,8 +160,22 @@ class PortfolioService:
             last_verified_at=now,
             conviction_at_entry=conviction_at_entry,
             peak_price_since_activation=None,
+            sleeve=resolve_sleeve(ticker, self.sleeves),
         )
         self.session.add(position)
+        self.session.flush()
+        return position
+
+    def reclassify_sleeve(self, position_id: int, new_sleeve: str) -> Position:
+        """The only writer of Position.sleeve besides initial assignment.
+        Unused by anything in this codebase yet — reserved for Part 4's
+        SPECULATIVE-crosses-15%-NAV-weight reclassification rule. Deliberately
+        separate from edit_manual_position: reclassification is a distinct,
+        rare, rule-triggered event, not a general field edit."""
+        position = self.session.get(Position, position_id)
+        if position is None:
+            raise PortfolioError(f"no position with id {position_id}")
+        position.sleeve = new_sleeve
         self.session.flush()
         return position
 
@@ -361,6 +237,7 @@ class PortfolioService:
                     last_verified_at=now,
                     conviction_at_entry=conviction_at_entry,
                     peak_price_since_activation=None,
+                    sleeve=resolve_sleeve(ticker, self.sleeves),
                 )
                 self.session.add(position)
             else:
@@ -394,27 +271,36 @@ class PortfolioService:
         if not self.config.allow_fractional and abs(qty - round(qty)) > QTY_TOLERANCE:
             raise PortfolioError(f"fractional qty {qty} not allowed (portfolio.allow_fractional is false)")
 
-    # ----------------------------------------------------------- CSV import
+    # ---------------------------------------------------------- broker sync
 
-    def import_flex_csv(self, source: str | IO[str], filename: str) -> ReconciliationResult:
-        text = source.read() if hasattr(source, "read") else source
-        rows = parse_flex_csv(text)
-        cash = parse_flex_cash_balance(text)  # already USD-filtered — see module docstring's currency trap note
-        result = self.reconcile(rows, filename=filename)
+    def record_broker_sync(
+        self,
+        rows: list[ImportedPosition],
+        cash_usd: Money,
+        source: str,
+        imported_at: dt.datetime | None = None,
+    ) -> ReconciliationResult:
+        """Reconcile the book against broker-reported USD equity rows and
+        record the sync as a `position_imports` row. `cash_usd` must be the
+        USD cash figure only — sources/ibkr_flex.py reads it from the Flex
+        Cash Report's USD row, never the base-currency (SGD) summary."""
+        if cash_usd.currency != "USD":
+            raise ReconciliationError(f"cash must be USD, got {cash_usd.currency}")
+        result = self.reconcile(rows, filename=source, imported_at=imported_at)
         record = PositionImport(
             imported_at=result.imported_at,
-            filename=filename,
+            filename=source,
             rows=result.rows,
             reconciliation_json=result.as_json(),
-            cash_usd=cash.amount if cash is not None else None,
+            cash_usd=cash_usd.amount,
         )
         self.session.add(record)
         self.session.flush()
         return result
 
     def latest_cash_balance(self) -> Money | None:
-        """None if there's never been an import, or the import's CSV had no
-        parseable cash row — distinct from an actual zero balance."""
+        """None if there's never been a broker sync — distinct from an
+        actual zero balance."""
         last = self.last_import()
         if last is None or last.cash_usd is None:
             return None
@@ -428,7 +314,7 @@ class PortfolioService:
     ) -> ReconciliationResult:
         """Compare imported broker positions against Z Money's book and update
         the book to match. Does not write a `position_imports` row itself —
-        `import_flex_csv` does that; call this directly only for a dry-run
+        `record_broker_sync` does that; call this directly only for a dry-run
         style reconciliation against an already-parsed row list."""
         now = imported_at or _utcnow()
         imported_by_ticker = {row.ticker: row for row in imported}
@@ -448,6 +334,7 @@ class PortfolioService:
                     last_verified_at=now,
                     conviction_at_entry=None,
                     peak_price_since_activation=None,
+                    sleeve=resolve_sleeve(ticker, self.sleeves),
                 )
                 self.session.add(position)
                 items.append(
@@ -490,35 +377,6 @@ class PortfolioService:
 
         self.session.flush()
         return ReconciliationResult(imported_at=now, filename=filename, rows=len(imported), items=items)
-
-    # ------------------------------------------------------------- drift
-
-    def check_drift(self, as_of: dt.datetime | None = None) -> DriftStatus:
-        """§2 drift warning: stale if the last CSV import is more than
-        `import_reminder_days` old. A never-imported book with open positions
-        counts as stale — those positions have no broker confirmation at
-        all. An empty book (nothing held) is never stale."""
-        now = as_of or _utcnow()
-        threshold = self.config.import_reminder_days
-        last = self.last_import()
-
-        if last is None:
-            has_positions = len(self.list_positions()) > 0
-            return DriftStatus(
-                stale=has_positions,
-                last_import_at=None,
-                days_since_import=None,
-                threshold_days=threshold,
-            )
-
-        days_since = (now - last.imported_at).total_seconds() / 86400
-        return DriftStatus(
-            stale=days_since > threshold,
-            last_import_at=last.imported_at,
-            days_since_import=days_since,
-            threshold_days=threshold,
-        )
-
 
 def _utcnow() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)

@@ -44,15 +44,38 @@ def lerp_by_conviction(score: float, at_0: float, at_100: float) -> float:
     return at_0 + (score / 100.0) * (at_100 - at_0)
 
 
-def update_peak_price(current_peak: float | None, current_price: float) -> float:
+def update_peak_price(
+    current_peak: float | None,
+    current_price: float,
+    avg_cost: float,
+    conviction_score: float | None,
+    scaling: ConvictionScalingConfig,
+) -> float | None:
     """§6: "peak_price_since_activation must be updated every run and
     persisted... Never recompute it from scratch." This is that one-step
     update — call it once per run per held position and persist the result
     to positions.peak_price_since_activation; don't rebuild it from price
-    history each time."""
-    if current_peak is None:
-        return current_price
-    return max(current_peak, current_price)
+    history each time.
+
+    But it's the *post-activation* peak (§3.5 / ZMONEY-CONTEXT.md) — a
+    position with no peak yet only gets one once its unrealized gain from
+    avg_cost clears its conviction-scaled activation_threshold_pct. Until
+    then this returns None, so trailing_stop_breached has nothing to
+    breach. Once activated, the running max persists forward even if price
+    later pulls back under that threshold — activation is a one-way gate,
+    not a re-checked condition.
+    """
+    if current_peak is not None:
+        return max(current_peak, current_price)
+    if not avg_cost or conviction_score is None:
+        return None
+    gain_pct = (current_price - avg_cost) / avg_cost * 100.0
+    threshold = lerp_by_conviction(
+        conviction_score, scaling.activation_threshold_pct.at_0, scaling.activation_threshold_pct.at_100
+    )
+    if gain_pct < threshold:
+        return None
+    return current_price
 
 
 # --------------------------------------------------------------- kill switches
@@ -181,7 +204,7 @@ def enforce_daily_proposal_cap(proposals: list[ScoredProposal], config: RiskConf
 
 # ---------------------------------------------------------- held-position exits
 
-ExitTriggerType = Literal["TRAILING_STOP", "PROFIT_BAND", "THESIS_DECAY"]
+ExitTriggerType = Literal["TRAILING_STOP", "PROFIT_BAND", "THESIS_DECAY", "HARD_STOP"]
 
 
 @dataclass
@@ -244,6 +267,17 @@ def profit_band_crossed(
     return gain_pct >= threshold, {"threshold_pct": threshold, "gain_pct": gain_pct}
 
 
+def hard_stop_breached(current_price: float, avg_cost: float, hard_stop_pct: float) -> tuple[bool, dict]:
+    """SPECULATIVE's only exit besides the 15%-NAV reclass (Part 4): an
+    absolute floor at hard_stop_pct from avg_cost (e.g. -60), unlike
+    TRAILING_STOP/PROFIT_BAND/THESIS_DECAY/CONVICTION_FLOOR, none of which
+    apply to this sleeve."""
+    if not avg_cost:
+        return False, {"reason": "no cost basis"}
+    gain_pct = (current_price - avg_cost) / avg_cost * 100.0
+    return gain_pct <= hard_stop_pct, {"gain_pct": gain_pct, "hard_stop_pct": hard_stop_pct}
+
+
 def thesis_decay_triggered(
     conviction_now: float, conviction_at_entry: float | None, config: RiskConfig
 ) -> tuple[bool, dict]:
@@ -281,14 +315,34 @@ def evaluate_held_position(
     scaling: ConvictionScalingConfig,
     config: RiskConfig,
     conviction_is_fresh: bool = True,
+    sleeve: str = "SWING",
+    hard_stop_pct: float | None = None,
 ) -> HeldPositionEvaluation:
     """`conviction_is_fresh=False` means `conviction_now` is a fallback, not
     a real score computed this run (see core/orchestrator.py) — thesis-decay
     is already guarded by `conviction_at_entry` being passed as None in that
     case, but the conviction floor has no such guard of its own, since it
     only looks at conviction_now. Suppressing it here keeps both triggers
-    off a fabricated number, not just the one whose guard happened to cover it."""
-    triggers: list[ExitTrigger] = []
+    off a fabricated number, not just the one whose guard happened to cover it.
+
+    `sleeve` gates which exit machinery applies at all (user-requested
+    sleeve architecture): CORE and HEDGE_CASH get no signal-based exits
+    whatsoever — they only ever exit via the concentration-based runner-rule
+    trim, which lives outside this function. SPECULATIVE swaps all four
+    triggers for a single hard_stop_pct floor. Only SWING runs the original
+    four, in their original priority order."""
+    if sleeve in ("CORE", "HEDGE_CASH"):
+        return HeldPositionEvaluation(ticker=ticker, triggers=[])
+
+    if sleeve == "SPECULATIVE":
+        triggers: list[ExitTrigger] = []
+        if hard_stop_pct is not None:
+            stop_hit, stop_detail = hard_stop_breached(current_price, avg_cost, hard_stop_pct)
+            if stop_hit:
+                triggers.append(ExitTrigger(type="HARD_STOP", detail=stop_detail))
+        return HeldPositionEvaluation(ticker=ticker, triggers=triggers)
+
+    triggers = []
 
     stop_hit, stop_detail = trailing_stop_breached(current_price, peak_price, atr_14, conviction_now, scaling)
     if stop_hit:

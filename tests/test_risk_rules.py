@@ -7,6 +7,7 @@ from core.risk_rules import (
     conviction_floor_triggered,
     enforce_daily_proposal_cap,
     evaluate_held_position,
+    hard_stop_breached,
     lerp_by_conviction,
     profit_band_crossed,
     size_new_position,
@@ -223,14 +224,117 @@ class TestThesisDecay:
 
 
 class TestUpdatePeakPrice:
-    def test_first_observation_becomes_peak(self):
-        assert update_peak_price(None, 100) == 100
+    def test_gain_below_activation_threshold_stays_unactivated(self):
+        # avg_cost 100, conviction 48 -> threshold ~21% (lerp(48, 8, 35)).
+        # 4.5% gain (IAU's actual run-up) never clears it.
+        assert update_peak_price(None, 104.5, avg_cost=100, conviction_score=48, scaling=SCALING) is None
 
-    def test_new_high_updates_peak(self):
-        assert update_peak_price(100, 110) == 110
+    def test_gain_clearing_activation_threshold_sets_peak(self):
+        assert update_peak_price(None, 125, avg_cost=100, conviction_score=48, scaling=SCALING) == 125
 
-    def test_lower_price_does_not_lower_peak(self):
-        assert update_peak_price(110, 100) == 110
+    def test_already_activated_peak_keeps_tracking_even_if_gain_now_below_threshold(self):
+        # Once activated, §6's "never recompute from scratch" applies — the
+        # running max persists even if price pulls back under the threshold.
+        assert update_peak_price(130, 95, avg_cost=100, conviction_score=48, scaling=SCALING) == 130
+
+    def test_already_activated_new_high_updates_peak(self):
+        assert update_peak_price(125, 140, avg_cost=100, conviction_score=48, scaling=SCALING) == 140
+
+    def test_no_conviction_score_cannot_activate(self):
+        # Without a real conviction score there's no threshold to test gain
+        # against, so the position must stay unactivated rather than guess.
+        assert update_peak_price(None, 200, avg_cost=100, conviction_score=None, scaling=SCALING) is None
+
+    def test_iau_scenario_never_activates_and_never_generates_trailing_stop(self):
+        """Regression test for the IAU bug: a position whose gain from cost
+        never clears its conviction-scaled activation threshold must never
+        acquire a peak_price_since_activation, and therefore must never be
+        able to produce a TRAILING_STOP exit — no matter how far it later
+        falls or how tight the ATR-implied stop would be."""
+        avg_cost = 83.995
+        conviction = 48.0  # threshold ~21% at this conviction
+        peak: float | None = None
+        for price in (84.0, 86.0, 87.76, 85.0, 82.0):  # never exceeds ~4.5% gain
+            peak = update_peak_price(peak, price, avg_cost=avg_cost, conviction_score=conviction, scaling=SCALING)
+
+        assert peak is None
+
+        evaluation = evaluate_held_position(
+            ticker="IAU",
+            current_price=82.0,  # -2.4% from cost
+            avg_cost=avg_cost,
+            peak_price=peak,
+            atr_14=2.0,  # tight ATR that would trivially breach a bogus peak
+            conviction_now=conviction,
+            conviction_at_entry=None,
+            scaling=SCALING,
+            config=RISK,
+        )
+        assert not any(t.type == "TRAILING_STOP" for t in evaluation.triggers)
+
+
+class TestHardStopBreached:
+    def test_breaches_at_or_below_threshold(self):
+        breached, detail = hard_stop_breached(current_price=40.0, avg_cost=100.0, hard_stop_pct=-60)
+        assert breached is True
+        assert detail["gain_pct"] == pytest.approx(-60.0)
+
+    def test_does_not_breach_above_threshold(self):
+        breached, _ = hard_stop_breached(current_price=45.0, avg_cost=100.0, hard_stop_pct=-60)
+        assert breached is False
+
+    def test_no_cost_basis_never_breaches(self):
+        breached, detail = hard_stop_breached(current_price=40.0, avg_cost=0.0, hard_stop_pct=-60)
+        assert breached is False
+        assert detail["reason"] == "no cost basis"
+
+
+class TestEvaluateHeldPositionSleeveGating:
+    def test_core_position_never_triggers_signal_based_exits(self):
+        # Numbers that would trivially trigger TRAILING_STOP, PROFIT_BAND,
+        # THESIS_DECAY, and CONVICTION_FLOOR all at once for a SWING position.
+        evaluation = evaluate_held_position(
+            ticker="VTI", current_price=50.0, avg_cost=100.0, peak_price=200.0, atr_14=1.0,
+            conviction_now=10.0, conviction_at_entry=90.0, scaling=SCALING, config=RISK,
+            sleeve="CORE",
+        )
+        assert evaluation.triggers == []
+
+    def test_hedge_cash_position_never_triggers_signal_based_exits(self):
+        evaluation = evaluate_held_position(
+            ticker="IAU", current_price=50.0, avg_cost=100.0, peak_price=200.0, atr_14=1.0,
+            conviction_now=10.0, conviction_at_entry=90.0, scaling=SCALING, config=RISK,
+            sleeve="HEDGE_CASH",
+        )
+        assert evaluation.triggers == []
+
+    def test_swing_position_keeps_existing_behavior_by_default(self):
+        # sleeve defaults to "SWING" — every pre-existing call site/test in
+        # this file keeps working unchanged.
+        evaluation = evaluate_held_position(
+            ticker="AMD", current_price=105, avg_cost=100, peak_price=108, atr_14=2.0,
+            conviction_now=70, conviction_at_entry=70, scaling=SCALING, config=RISK,
+        )
+        assert evaluation.has_exit_signal is False
+
+    def test_speculative_position_ignores_conviction_floor_and_uses_hard_stop(self):
+        # conviction_now=0 would trivially trigger CONVICTION_FLOOR on SWING;
+        # SPECULATIVE must ignore it and only check the hard stop.
+        evaluation = evaluate_held_position(
+            ticker="RKLB", current_price=100.0, avg_cost=100.0, peak_price=150.0, atr_14=1.0,
+            conviction_now=0.0, conviction_at_entry=50.0, scaling=SCALING, config=RISK,
+            sleeve="SPECULATIVE", hard_stop_pct=-60,
+        )
+        assert evaluation.triggers == []
+
+    def test_speculative_position_hard_stop_fires(self):
+        evaluation = evaluate_held_position(
+            ticker="RKLB", current_price=39.0, avg_cost=100.0, peak_price=150.0, atr_14=1.0,
+            conviction_now=50.0, conviction_at_entry=50.0, scaling=SCALING, config=RISK,
+            sleeve="SPECULATIVE", hard_stop_pct=-60,
+        )
+        assert evaluation.has_exit_signal is True
+        assert evaluation.primary_trigger.type == "HARD_STOP"
 
 
 class TestEvaluateHeldPosition:

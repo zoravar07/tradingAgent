@@ -65,6 +65,7 @@ from core.models import (
     BriefingRecord,
     Candidate,
     Conviction as ConvictionRow,
+    CostEvent,
     Proposal,
     ResearchOutput,
     RiskEvent,
@@ -306,6 +307,11 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row, new
 
     # ---------------------------------------------------------------- Stage 2
     stage2_results = run_stage2_batch(llm, stage1_survivors, config.screener.stage2, screener_inputs)
+    # One UsageRecord object is shared across every ticker scored in the same
+    # batched chunk call (see run_stage2_batch) — dedupe by identity so a
+    # 40-ticker chunk logs one cost event, not forty.
+    for usage in {id(r.usage): r.usage for r in stage2_results if r.usage is not None}.values():
+        _log_cost_event(session, run_row.id, "stage2_triage", None, usage, inputs.as_of)
     candidate_rows = {
         row.ticker: row
         for row in session.execute(select(Candidate).where(Candidate.run_id == run_row.id)).scalars()
@@ -357,6 +363,10 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row, new
             digest = run_news_digest(llm, ctx.ticker, config.research, cache=news_cache)
             digests_by_ticker[ctx.ticker] = digest
             ctx.news_digest = digest
+            # digest.usage is None on a cache hit (run_news_digest never
+            # calls the model then) — _log_cost_event no-ops on None, so a
+            # cached digest correctly logs zero cost.
+            _log_cost_event(session, run_row.id, "news_digest", ctx.ticker, digest.usage, inputs.as_of)
             if not digest.ok:
                 session.add(RiskEvent(run_id=run_row.id, type="NEWS_DIGEST_FAILED", detail_json=json.dumps({"ticker": ctx.ticker, "error": digest.error})))
                 logger.warning("news digest failed ticker=%s error=%s", ctx.ticker, digest.error)
@@ -365,6 +375,7 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row, new
     conviction_by_ticker: dict[str, float] = {}
     memo_by_ticker: dict[str, object] = {}
     for rr in research_results:
+        _log_cost_event(session, run_row.id, "research_memo", rr.ticker, rr.usage, inputs.as_of)
         if not rr.ok:
             session.add(RiskEvent(run_id=run_row.id, type="RESEARCH_FAILED", detail_json=json.dumps({"ticker": rr.ticker, "error": rr.error})))
             logger.warning("research failed ticker=%s error=%s", rr.ticker, rr.error)
@@ -850,6 +861,29 @@ def holdings_due_for_refresh(session: Session, held_tickers: list[str], run_id: 
     per_run = -(-len(held_tickers) // refresh_days)
     oldest = sorted((t for t in held_tickers if t in last_seen), key=lambda t: last_seen[t])[:per_run]
     return never | set(oldest)
+
+
+def _log_cost_event(
+    session: Session,
+    run_id: int,
+    stage: str,
+    ticker: str | None,
+    usage,
+    as_of: dt.datetime,
+) -> None:
+    """Persist one priced LLM call (Part 6 cost audit: previously only a
+    running monthly total existed, so "where did the money go" required
+    reconstructing costs from research_outputs' token counts by hand). A
+    no-op when `usage` is None — a cached digest, for instance, makes no
+    call and costs nothing, so it logs nothing."""
+    if usage is None:
+        return
+    session.add(CostEvent(
+        run_id=run_id, stage=stage, ticker=ticker, model=usage.model,
+        input_tokens=usage.input_tokens, output_tokens=usage.output_tokens,
+        web_search_requests=usage.web_search_requests, cost_usd=usage.cost_usd,
+        created_at=as_of,
+    ))
 
 
 def _distance_to_stop_pct(evaluation, current_price: float) -> float | None:

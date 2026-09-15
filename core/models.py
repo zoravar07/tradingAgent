@@ -162,6 +162,34 @@ class RiskEvent(Base):
     detail_json: Mapped[str] = mapped_column(Text, nullable=False)
 
 
+class CostEvent(Base):
+    """One row per priced LLM call — the Part 6 cost-audit gap: previously
+    only a running monthly total was persisted (MonthlySpendTracker), so
+    "where did the money go" required reconstructing costs from
+    research_outputs' token counts by hand. `stage` is one of
+    'stage2_triage' (one row per batched Stage 2 chunk call, not per
+    ticker scored — see agents/screener.py's run_stage2_batch, where a
+    single UsageRecord is shared across every ticker in that chunk),
+    'news_digest', or 'research_memo'. `ticker` is None for stage2_triage
+    (one call covers many tickers); set for the other two. Query
+    `SELECT run_id, stage, SUM(cost_usd) FROM cost_events GROUP BY run_id, stage`
+    for the per-run-per-stage breakdown; drop the GROUP BY stage for a
+    per-run total."""
+
+    __tablename__ = "cost_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("runs.id"), nullable=False)
+    stage: Mapped[str] = mapped_column(String, nullable=False)
+    ticker: Mapped[str | None] = mapped_column(String, nullable=True)
+    model: Mapped[str] = mapped_column(String, nullable=False)
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
+    output_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
+    web_search_requests: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cost_usd: Mapped[float] = mapped_column(Float, nullable=False)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, nullable=False)
+
+
 class SleeveBreachState(Base):
     """One row per sleeve, updated once per run — core.sleeves.update_breach_streak's
     persisted state. `direction`/`streak_days` mirror SleeveBreachStatus;

@@ -518,6 +518,23 @@ class TestFullNightlyRun:
         # --- LLM spend was tracked
         assert llm.budget.spent_this_month() > 0
 
+        # --- and now attributable per run and per stage (Part 6 cost audit),
+        # not just as a running monthly total
+        from core.models import CostEvent
+
+        cost_events = list(session.execute(select(CostEvent)).scalars())
+        by_stage: dict[str, list[CostEvent]] = {}
+        for e in cost_events:
+            by_stage.setdefault(e.stage, []).append(e)
+        assert set(by_stage) == {"stage2_triage", "news_digest", "research_memo"}
+        assert len(by_stage["stage2_triage"]) == 1  # one batched chunk call, not one per ticker scored
+        assert {e.ticker for e in by_stage["news_digest"]} == {"NBIS", "AMD"}
+        assert {e.ticker for e in by_stage["research_memo"]} == {"NBIS", "AMD"}
+        assert all(e.run_id == run_row.id for e in cost_events)
+        assert all(e.cost_usd > 0 for e in cost_events)
+        total_logged = sum(e.cost_usd for e in cost_events)
+        assert total_logged == pytest.approx(llm.budget.spent_this_month())
+
         # --- NAV computed from positions + cash, sector/cluster from held book
         nav_row = session.execute(select(NavSnapshot)).scalar_one()
         assert nav_row.nav_usd == pytest.approx(100_000.0)  # 8*222 (NBIS) + 98,224 cash

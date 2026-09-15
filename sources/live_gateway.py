@@ -109,6 +109,12 @@ class LiveMarketDataGateway:
         self.etf_tickers = {t.upper() for t in (etf_tickers or [])}
         self._spy_bars_cache = None  # YFinanceClient itself caches the fetch; this avoids re-parsing per ticker
 
+    def prefetch(self, tickers: list[str]) -> int:
+        """Batch-warm the 2y history cache for the whole universe (plus SPY,
+        which every technical snapshot compares against) before Stage 1
+        walks it name by name."""
+        return self.yf.prefetch_history([*tickers, "SPY"])
+
     def _spy_bars(self):
         if self._spy_bars_cache is None:
             self._spy_bars_cache = self.yf.get_historical_bars("SPY")
@@ -129,15 +135,23 @@ class LiveMarketDataGateway:
                 return [*default, {"error": str(exc)}]
             return default
 
-    def _income_statement(self, ticker: str, limit: int) -> tuple[list[dict], str]:
+    def _income_statement(self, ticker: str, limit: int, allow_fmp_fallback: bool = True) -> tuple[list[dict], str]:
         """yfinance first (free, uncapped, verified reliable); FMP fallback
         only if yfinance itself has nothing — see module docstring for why
         this order flipped from an FMP-first original. Returns (rows,
         source) so callers can note in the research context which one
-        actually served the data."""
+        actually served the data.
+
+        `allow_fmp_fallback=False` makes this yfinance-only: Stage 1 uses it
+        for non-held names, because on a ~500-name scan every name yfinance
+        can't cover would otherwise burn up to two budgeted (and, on this
+        plan, usually 402-ing) FMP calls — enough to exhaust the day's cap
+        before Research runs."""
         try:
             return self.yf.get_income_statement(ticker, limit=limit), "yfinance"
         except Exception as yf_exc:  # noqa: BLE001
+            if not allow_fmp_fallback:
+                raise RuntimeError(f"income statement unavailable for {ticker} on yfinance: {yf_exc}") from yf_exc
             try:
                 return self.fmp.get_income_statement(ticker, limit=limit), "fmp_fallback"
             except Exception as fmp_exc:  # noqa: BLE001
@@ -146,10 +160,12 @@ class LiveMarketDataGateway:
                     f"FMP fallback also failed ({fmp_exc})"
                 ) from fmp_exc
 
-    def _cash_flow_statement(self, ticker: str, limit: int) -> tuple[list[dict], str]:
+    def _cash_flow_statement(self, ticker: str, limit: int, allow_fmp_fallback: bool = True) -> tuple[list[dict], str]:
         try:
             return self.yf.get_cash_flow_statement(ticker, limit=limit), "yfinance"
         except Exception as yf_exc:  # noqa: BLE001
+            if not allow_fmp_fallback:
+                raise RuntimeError(f"cash flow statement unavailable for {ticker} on yfinance: {yf_exc}") from yf_exc
             try:
                 return self.fmp.get_cash_flow_statement(ticker, limit=limit), "fmp_fallback"
             except Exception as fmp_exc:  # noqa: BLE001
@@ -162,11 +178,15 @@ class LiveMarketDataGateway:
 
     def get_screener_input(self, ticker: str, is_held: bool) -> ScreenerInput:
         is_etf = ticker.upper() in self.etf_tickers
-        profile = self.fmp.get_profile(ticker)
-        # No FMP `quote` call here at all — price comes from yfinance below,
-        # and quote has neither `pe` nor `avgVolume` on the current stable
-        # API anyway (see module docstring), so it bought nothing but budget
-        # spent on a heavily-gated endpoint.
+        # No FMP call anywhere in Stage 1. Market cap and average volume used
+        # to come from FMP's `profile` (one budgeted call per name), which
+        # capped the scannable universe at well under the 250/day free tier
+        # — a full S&P 500 scan alone would be ~500 calls. yfinance's
+        # fast_info carries both fields (verified live: marketCap,
+        # threeMonthAverageVolume, lastPrice) for free, so Stage 1 now runs
+        # entirely on yfinance and FMP budget is spent only on the handful of
+        # names that reach Research (see get_research_context).
+        quote = self.yf.get_quote_snapshot(ticker)
         # ETFs skip the fundamentals fetch entirely — no income statement
         # exists to try yfinance-then-FMP on, so attempting it would just be
         # two guaranteed failures before falling through to the same result
@@ -176,22 +196,25 @@ class LiveMarketDataGateway:
             revenue_growth_pct = None
             income = []
         else:
-            income, _ = self._income_statement(ticker, limit=2)
-            cash_flow, _ = self._cash_flow_statement(ticker, limit=1)
+            # Held names may fall back to FMP (a bounded ~16 names, and losing
+            # Stage 1 coverage on a holding is worse than two calls); every
+            # other name is yfinance-only so the scan can't drain the cap.
+            income, _ = self._income_statement(ticker, limit=2, allow_fmp_fallback=is_held)
+            cash_flow, _ = self._cash_flow_statement(ticker, limit=1, allow_fmp_fallback=is_held)
             free_cash_flow = cash_flow[0].get("freeCashFlow") if cash_flow else None
             revenue_growth_pct = _latest_revenue_growth_pct(income)
         bars = self.yf.get_historical_bars(ticker)
 
         technical = compute_technical_snapshot(bars, spy_bars=self._spy_bars(), sector_bars=None)
 
-        price = self.yf.get_current_price(ticker)
-        avg_volume = profile.get("averageVolume")
-        adv_usd = (avg_volume * price) if (avg_volume and price) else None
+        # fast_info was already fetched for the quote snapshot; don't pay for
+        # it twice per name. Fall back to the price call only if it had no price.
+        price = quote.last_price if quote.last_price is not None else self.yf.get_current_price(ticker)
 
         return ScreenerInput(
             ticker=ticker,
-            market_cap_usd=profile.get("mktCap"),
-            avg_daily_volume_usd=adv_usd,
+            market_cap_usd=quote.market_cap,
+            avg_daily_volume_usd=quote.avg_daily_volume_usd,
             technical=technical,
             trailing_pe=_trailing_pe(price, income),
             free_cash_flow=free_cash_flow,
@@ -214,6 +237,11 @@ class LiveMarketDataGateway:
         is_etf = ticker.upper() in self.etf_tickers
         profile = self._safe(lambda: self.fmp.get_profile(ticker), {})
         current_price = self._safe(lambda: self.yf.get_current_price(ticker), None)
+        # yfinance's quote snapshot, not FMP profile's mktCap — the same
+        # free field Stage 1 already fetched for this ticker (get_screener_input),
+        # so this is a cache hit, not a second network cost. FMP's mktCap
+        # duplicated data already in hand; dropped rather than cross-checked.
+        market_cap = self._safe(lambda: self.yf.get_quote_snapshot(ticker).market_cap, None)
 
         if is_etf:
             # An ETF has no income statement, earnings surprises, analyst
@@ -246,7 +274,7 @@ class LiveMarketDataGateway:
         lines = [
             f"Company: {profile.get('companyName', ticker)} ({ticker})",
             f"Sector: {profile.get('sector')} / Industry: {profile.get('industry')}",
-            f"Market cap: {profile.get('mktCap')}",
+            f"Market cap: {market_cap}",  # yfinance, not FMP profile — see above
             f"Price: {current_price}",  # current_price from yfinance, not FMP quote
             f"Description: {profile.get('description', '')[:1000]}",
             "",

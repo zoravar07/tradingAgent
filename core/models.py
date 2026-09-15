@@ -31,6 +31,14 @@ class Position(Base):
     last_verified_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
     conviction_at_entry: Mapped[float | None] = mapped_column(Float, nullable=True)
     peak_price_since_activation: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Assigned once at position-open time (core/portfolio.py's three
+    # Position(...) construction sites) via core.sleeves.resolve_sleeve.
+    # Never drifts afterward except through PortfolioService.reclassify_sleeve
+    # (Part 4's SPECULATIVE-crosses-15%-NAV rule) — editing config.yaml's
+    # ticker lists after the fact does NOT retroactively move a stored
+    # position; core.sleeves.find_sleeve_drift is the startup check that
+    # surfaces (never auto-fixes) that mismatch.
+    sleeve: Mapped[str] = mapped_column(String, nullable=False, default="SWING")
 
 
 class PositionImport(Base):
@@ -127,6 +135,12 @@ class Proposal(Base):
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, nullable=False)
     filled_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
     fill_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Informational only (core.sleeves.speculative_look_reasons) — set when
+    # a new BUY defaulted to SWING but has characteristics (small market
+    # cap, negative FCF, no earnings) that look SPECULATIVE. Never blocks
+    # the BUY. NULL for every proposal type except a fresh SWING new-BUY,
+    # and for every proposal recorded before this column existed.
+    speculative_warning_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class WatchlistItem(Base):
@@ -146,6 +160,19 @@ class RiskEvent(Base):
     run_id: Mapped[int] = mapped_column(ForeignKey("runs.id"), nullable=False)
     type: Mapped[str] = mapped_column(String, nullable=False)
     detail_json: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class SleeveBreachState(Base):
+    """One row per sleeve, updated once per run — core.sleeves.update_breach_streak's
+    persisted state. `direction`/`streak_days` mirror SleeveBreachStatus;
+    `last_run_id` is audit trail, not used by the streak logic itself."""
+
+    __tablename__ = "sleeve_breach_state"
+
+    sleeve: Mapped[str] = mapped_column(String, primary_key=True)
+    direction: Mapped[str | None] = mapped_column(String, nullable=True)  # 'OVER' | 'UNDER' | NULL
+    streak_days: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_run_id: Mapped[int] = mapped_column(ForeignKey("runs.id"), nullable=False)
 
 
 class ConfigVersion(Base):
@@ -201,3 +228,45 @@ class BriefingRecord(Base):
     run_id: Mapped[int] = mapped_column(ForeignKey("runs.id"), nullable=False, unique=True)
     briefing_json: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, nullable=False)
+
+
+class JournalEntry(Base):
+    """Freeform notes tied to a date and, optionally, a ticker (§10 UI,
+    Journal screen). Deliberately the simplest table in the schema: the
+    point is a place to write down why you did something, in your own
+    words, next to the run that prompted it — not another structured
+    record the pipeline has to keep in sync.
+
+    `date` is the day the note is *about* (which is usually, but not
+    always, the day it was written), so a note can be filed against the
+    run it belongs to. `linked_ticker` is nullable because plenty of
+    notes are about the book as a whole, not one name.
+    """
+
+    __tablename__ = "journal_entries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    date: Mapped[dt.datetime] = mapped_column(DateTime, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    linked_ticker: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
+
+
+class AccountValue(Base):
+    """One broker-reported portfolio value per calendar day, from the Flex
+    Web Service's Net Asset Value / Equity Summary section, written by the
+    position sync (sources/ibkr_flex.py). `nav_base` is in the account's
+    base currency (SGD here); `nav_usd` is that figure divided by the
+    USD->base fx rate the same report carries. This is the account's actual
+    value, as opposed to nav_snapshots, which is the pipeline's own
+    positions-times-price estimate at run time."""
+
+    __tablename__ = "account_values"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    report_date: Mapped[str] = mapped_column(String, unique=True, nullable=False)  # YYYY-MM-DD
+    nav_base: Mapped[float] = mapped_column(Float, nullable=False)
+    base_currency: Mapped[str] = mapped_column(String, nullable=False)
+    fx_rate_to_base: Mapped[float] = mapped_column(Float, nullable=False)  # base units per 1 USD
+    nav_usd: Mapped[float] = mapped_column(Float, nullable=False)
+    source: Mapped[str] = mapped_column(String, nullable=False)
+    synced_at: Mapped[dt.datetime] = mapped_column(DateTime, nullable=False)

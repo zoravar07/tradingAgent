@@ -131,11 +131,16 @@ def size_new_position(
     cash_available_usd: float,
     scaling: ConvictionScalingConfig,
     config: RiskConfig,
+    sleeve_room: float | None = None,
 ) -> SizingResult:
     """Applies §5.3's ordered caps for a single candidate: conviction+
     volatility target -> max_position_pct -> sector room -> cluster room ->
-    cash available -> min_order_value_usd floor. Each cap can only shrink the
-    size further; nothing after the first step can increase it."""
+    sleeve room -> cash available -> min_order_value_usd floor. Each cap can
+    only shrink the size further; nothing after the first step can increase
+    it. `sleeve_room` (core.sleeves.sleeve_room) is None for callers that
+    don't know about sleeves yet — an over-band sleeve caps room to zero,
+    which trips the min_order_value_usd floor below and rejects the BUY,
+    i.e. "blocks new BUYs into that sleeve," not a separate hard gate."""
     reasons: list[str] = []
 
     conviction_target = lerp_by_conviction(
@@ -159,6 +164,10 @@ def size_new_position(
         if pct > cluster_room:
             reasons.append(f"capped by correlated-cluster room {cluster_room:.1f}% (cluster {cluster})")
             pct = cluster_room
+
+    if sleeve_room is not None and pct > sleeve_room:
+        reasons.append(f"capped by sleeve room {sleeve_room:.1f}%")
+        pct = sleeve_room
 
     position_usd = nav_usd * (pct / 100.0)
     if position_usd > cash_available_usd:
@@ -185,6 +194,45 @@ def size_new_position(
         conviction_target_pct=conviction_target,
         volatility_multiplier=vol_multiplier,
     )
+
+
+def size_speculative_position(
+    nav_usd: float,
+    cash_available_usd: float,
+    sleeve_room: float,
+    open_speculative_slots: int,
+    sleeve_config,  # core.config.SleeveConfig — the SPECULATIVE entry
+    config: RiskConfig,
+) -> SizingResult:
+    """SPECULATIVE is "sized by slots not conviction: 5 slots at 2.5% NAV
+    each" — no conviction_score parameter here at all, unlike
+    size_new_position. Slot count and slot_pct both come from the
+    SPECULATIVE sleeve's config entry, not a global RiskConfig field,
+    since they only apply to this one sleeve."""
+    reasons: list[str] = []
+
+    if sleeve_config.slot_count is not None and open_speculative_slots >= sleeve_config.slot_count:
+        return SizingResult(
+            approved=False, position_pct=0.0, position_usd=0.0,
+            reasons=[f"all {sleeve_config.slot_count} SPECULATIVE slots filled"],
+        )
+
+    pct = sleeve_config.slot_pct or 0.0
+    if pct > sleeve_room:
+        reasons.append(f"capped by sleeve room {sleeve_room:.1f}%")
+        pct = sleeve_room
+
+    position_usd = nav_usd * (pct / 100.0)
+    if position_usd > cash_available_usd:
+        reasons.append(f"capped by cash available ${cash_available_usd:,.0f}")
+        position_usd = cash_available_usd
+        pct = (position_usd / nav_usd * 100.0) if nav_usd > 0 else 0.0
+
+    if position_usd < config.min_order_value_usd:
+        reasons.append(f"below min_order_value_usd ${config.min_order_value_usd:,.0f}")
+        return SizingResult(approved=False, position_pct=0.0, position_usd=0.0, reasons=reasons)
+
+    return SizingResult(approved=True, position_pct=pct, position_usd=position_usd, reasons=reasons)
 
 
 @dataclass

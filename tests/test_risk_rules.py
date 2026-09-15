@@ -1,6 +1,6 @@
 import pytest
 
-from core.config import ConvictionScalingConfig, RiskConfig
+from core.config import ConvictionScalingConfig, RiskConfig, SleeveConfig
 from core.risk_rules import (
     ScoredProposal,
     check_kill_switches,
@@ -11,6 +11,7 @@ from core.risk_rules import (
     lerp_by_conviction,
     profit_band_crossed,
     size_new_position,
+    size_speculative_position,
     thesis_decay_triggered,
     trailing_stop_breached,
     update_peak_price,
@@ -136,6 +137,82 @@ class TestSizeNewPosition:
     def test_no_sector_or_cluster_skips_those_caps(self):
         result = size_new_position(**self.base_kwargs(sector=None, cluster=None))
         assert result.approved is True
+
+
+class TestSizeNewPositionSleeveRoom:
+    def test_sleeve_room_caps_position_size(self):
+        result = size_new_position(
+            conviction_score=90, atr_pct_of_price=None, nav_usd=100_000, sector=None, cluster=None,
+            current_sector_pct={}, current_cluster_pct={}, cash_available_usd=100_000,
+            scaling=SCALING, config=RISK, sleeve_room=3.0,
+        )
+        assert result.approved is True
+        assert result.position_pct == pytest.approx(3.0)
+        assert any("sleeve room" in r for r in result.reasons)
+
+    def test_zero_sleeve_room_rejects_the_buy(self):
+        result = size_new_position(
+            conviction_score=90, atr_pct_of_price=None, nav_usd=100_000, sector=None, cluster=None,
+            current_sector_pct={}, current_cluster_pct={}, cash_available_usd=100_000,
+            scaling=SCALING, config=RISK, sleeve_room=0.0,
+        )
+        assert result.approved is False
+
+    def test_none_sleeve_room_means_uncapped(self):
+        # existing callers that don't know about sleeves yet keep working
+        result = size_new_position(
+            conviction_score=90, atr_pct_of_price=None, nav_usd=100_000, sector=None, cluster=None,
+            current_sector_pct={}, current_cluster_pct={}, cash_available_usd=100_000,
+            scaling=SCALING, config=RISK,
+        )
+        assert result.approved is True
+
+
+SPECULATIVE = SleeveConfig(
+    target_pct=7, band_low_pct=0, band_high_pct=12, tickers=["RKLB", "SOFI"],
+    slot_count=5, slot_pct=2.5, hard_stop_pct=-60, reclass_at_pct=15,
+)
+
+
+class TestSizeSpeculativePosition:
+    def test_sizes_at_fixed_slot_pct_regardless_of_room(self):
+        result = size_speculative_position(
+            nav_usd=100_000, cash_available_usd=100_000, sleeve_room=10.0,
+            open_speculative_slots=1, sleeve_config=SPECULATIVE, config=RISK,
+        )
+        assert result.approved is True
+        assert result.position_pct == pytest.approx(2.5)
+        assert result.position_usd == pytest.approx(2_500.0)
+
+    def test_all_slots_filled_rejects(self):
+        result = size_speculative_position(
+            nav_usd=100_000, cash_available_usd=100_000, sleeve_room=10.0,
+            open_speculative_slots=5, sleeve_config=SPECULATIVE, config=RISK,
+        )
+        assert result.approved is False
+        assert any("slots filled" in r for r in result.reasons)
+
+    def test_sleeve_room_caps_slot_size(self):
+        result = size_speculative_position(
+            nav_usd=100_000, cash_available_usd=100_000, sleeve_room=1.0,
+            open_speculative_slots=0, sleeve_config=SPECULATIVE, config=RISK,
+        )
+        assert result.position_pct == pytest.approx(1.0)
+
+    def test_cash_available_caps_position(self):
+        result = size_speculative_position(
+            nav_usd=100_000, cash_available_usd=1_000, sleeve_room=10.0,
+            open_speculative_slots=0, sleeve_config=SPECULATIVE, config=RISK,
+        )
+        assert result.position_usd == pytest.approx(1_000.0)
+
+    def test_below_min_order_value_rejects(self):
+        tiny_risk = RiskConfig(min_order_value_usd=10_000)
+        result = size_speculative_position(
+            nav_usd=100_000, cash_available_usd=100_000, sleeve_room=10.0,
+            open_speculative_slots=0, sleeve_config=SPECULATIVE, config=tiny_risk,
+        )
+        assert result.approved is False
 
 
 class TestDailyProposalCap:

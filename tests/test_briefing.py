@@ -8,6 +8,7 @@ from core.briefing import (
     BookEntry,
     OvernightChange,
     PortfolioHealth,
+    SleeveBreachAdvisory,
     UnpricedPosition,
     UnresearchedHolding,
     WatchlistItem,
@@ -17,7 +18,6 @@ from core.briefing import (
     sort_actions_by_conviction,
     sort_book_by_attention,
 )
-from core.portfolio import DriftStatus
 
 NOW = dt.datetime(2026, 8, 25, 6, 0, 0)
 
@@ -98,8 +98,7 @@ class TestAssembleBriefing:
             overnight_changes=[OvernightChange(ticker="AMD", summary="guidance raised")],
             book=[book_entry("A", weight_pct=1), book_entry("B", weight_pct=10)],
             portfolio_health=PortfolioHealth(cash_pct=5.0),
-            drift=None,
-        )
+                    )
         kwargs.update(overrides)
         return kwargs
 
@@ -119,20 +118,6 @@ class TestAssembleBriefing:
         briefing = assemble_briefing(**self.base_kwargs())
         assert [e.ticker for e in briefing.book] == ["B", "A"]
 
-    def test_fresh_drift_suppressed(self):
-        fresh = DriftStatus(stale=False, last_import_at=NOW, days_since_import=1.0, threshold_days=7)
-        briefing = assemble_briefing(**self.base_kwargs(drift=fresh))
-        assert briefing.drift_warning is None
-
-    def test_stale_drift_surfaced(self):
-        stale = DriftStatus(stale=True, last_import_at=None, days_since_import=None, threshold_days=7)
-        briefing = assemble_briefing(**self.base_kwargs(drift=stale))
-        assert briefing.drift_warning is stale
-
-    def test_no_import_ever_drift_surfaced(self):
-        briefing = assemble_briefing(**self.base_kwargs(drift=None))
-        assert briefing.drift_warning is None
-
 
 class TestRenderBriefingText:
     def test_renders_all_sections(self):
@@ -145,8 +130,7 @@ class TestRenderBriefingText:
             overnight_changes=[OvernightChange(ticker="AMD", summary="guidance raised")],
             book=[book_entry("NBIS", weight_pct=1.8, has_exit_trigger=True)],
             portfolio_health=PortfolioHealth(cash_pct=98.2, drawdown_from_peak_pct=0.0, kill_switch=KillSwitchStatus(triggered=False)),
-            drift=None,
-        )
+                    )
         text = render_briefing_text(briefing)
         assert "ANET" in text
         assert "strong margins" in text
@@ -161,20 +145,11 @@ class TestRenderBriefingText:
     def test_empty_sections_render_placeholder(self):
         briefing = assemble_briefing(
             generated_at=NOW, actions_today=[], watching=[], overnight_changes=[], book=[],
-            portfolio_health=PortfolioHealth(), drift=None,
+            portfolio_health=PortfolioHealth(),
         )
         text = render_briefing_text(briefing)
         assert "(none)" in text
         assert "(no open positions)" in text
-
-    def test_drift_warning_rendered_when_present(self):
-        stale = DriftStatus(stale=True, last_import_at=None, days_since_import=None, threshold_days=7)
-        briefing = assemble_briefing(
-            generated_at=NOW, actions_today=[], watching=[], overnight_changes=[], book=[],
-            portfolio_health=PortfolioHealth(), drift=stale,
-        )
-        text = render_briefing_text(briefing)
-        assert "DRIFT WARNING" in text
 
 
 class TestAssembleBlockedBriefing:
@@ -192,7 +167,6 @@ class TestAssembleBlockedBriefing:
         assert briefing.watching == []
         assert briefing.overnight_changes == []
         assert briefing.book == []
-        assert briefing.drift_warning is None
 
     def test_carries_the_unpriced_list(self):
         unpriced = [UnpricedPosition(ticker="CEG", error="402"), UnpricedPosition(ticker="CLS", error="402")]
@@ -216,7 +190,7 @@ class TestUnresearchedHoldings:
     def base_kwargs(self, **overrides):
         kwargs = dict(
             generated_at=NOW, actions_today=[], watching=[], overnight_changes=[],
-            book=[], portfolio_health=PortfolioHealth(), drift=None,
+            book=[], portfolio_health=PortfolioHealth(),
         )
         kwargs.update(overrides)
         return kwargs
@@ -273,3 +247,39 @@ class TestUnresearchedHoldings:
         assert "conviction 54" in text
         assert "conviction n/a" not in text
         assert "NO RESEARCH COVERAGE" not in text
+
+
+class TestFormatAge:
+    def test_hours_under_a_day_days_from_a_day(self):
+        from core.briefing import format_age
+
+        assert format_age(14 / 24) == "14h"
+        assert format_age(0.01) == "1h"  # never "0h"
+        assert format_age(1.0) == "1d"
+        assert format_age(2.6) == "3d"
+
+    def test_book_line_uses_hours_for_a_reused_score_from_last_night(self):
+        entry = BookEntry(ticker="AMD", qty=1, value_usd=1.0, weight_pct=1.0, unrealized_pnl_pct=0.0, conviction_now=58.0, conviction_run_id=6, conviction_age_days=14 / 24)
+        briefing = assemble_briefing(generated_at=NOW, actions_today=[], watching=[], overnight_changes=[], book=[entry], portfolio_health=PortfolioHealth())
+        assert "conviction 58 (from run 6, 14h old)" in render_briefing_text(briefing)
+
+
+class TestSpeculativeWarningOnActionItem:
+    def test_defaults_to_empty_list(self):
+        item = ActionItem(order=order(), headline="New position")
+        assert item.speculative_warning == []
+
+    def test_can_carry_reasons(self):
+        item = ActionItem(order=order(), headline="New position", speculative_warning=["negative free cash flow"])
+        assert item.speculative_warning == ["negative free cash flow"]
+
+
+class TestSleeveBandBreachesOnPortfolioHealth:
+    def test_defaults_to_empty_list(self):
+        health = PortfolioHealth()
+        assert health.sleeve_band_breaches == []
+
+    def test_can_carry_advisories(self):
+        advisory = SleeveBreachAdvisory(sleeve="SWING", direction="OVER", weight_pct=47.0, streak_days=11)
+        health = PortfolioHealth(sleeve_band_breaches=[advisory])
+        assert health.sleeve_band_breaches[0].sleeve == "SWING"

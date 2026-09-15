@@ -16,9 +16,9 @@ algorithms:
   portfolio weight — a documented judgment call, same pattern as the
   screener ranking calls in steps 4/6.
 
-The drift warning (§2) is surfaced on the briefing only when it's actually
-stale — a fresh import produces `drift_warning=None`, not a status object
-the UI has to remember to check `.stale` on.
+Positions are synced from the broker (sources/ibkr_flex.py) before every
+run and the run halts if that sync fails, so there is no "drift" state to
+warn about: a briefing that exists was built on the broker's book.
 """
 
 from __future__ import annotations
@@ -28,7 +28,6 @@ from dataclasses import dataclass, field
 
 from agents.order_builder import OrderProposal
 from core.risk_rules import KillSwitchStatus
-from core.portfolio import DriftStatus
 
 
 @dataclass
@@ -37,6 +36,10 @@ class ActionItem:
     headline: str  # e.g. "New position", "Trailing stop triggered", "Trim 50%"
     thesis_summary: str | None = None
     bear_case: str | None = None
+    # Informational only (core.sleeves.speculative_look_reasons) — set on a
+    # new BUY that defaulted to SWING but looks SPECULATIVE by market cap /
+    # FCF / earnings. Empty for every other action item.
+    speculative_warning: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -72,12 +75,25 @@ class BookEntry:
     # the table itself says so, on top of the top-of-briefing banner
     # (see UnresearchedHolding / Briefing.unresearched_holdings below).
     no_research_coverage: bool = False
+    # When conviction_now is a real score reused from an earlier run (the
+    # holdings refresh cadence, or a failed refresh), these say which run
+    # and how old. Never set alongside a fresh score.
+    conviction_run_id: int | None = None
+    conviction_age_days: float | None = None  # fractional; rendered as hours under a day
 
 
 @dataclass
 class UnresearchedHolding:
     ticker: str
     reason: str
+
+
+@dataclass
+class SleeveBreachAdvisory:
+    sleeve: str
+    direction: str  # 'OVER' | 'UNDER'
+    weight_pct: float
+    streak_days: int
 
 
 @dataclass
@@ -88,6 +104,10 @@ class PortfolioHealth:
     cash_pct: float = 0.0
     drawdown_from_peak_pct: float = 0.0
     kill_switch: KillSwitchStatus | None = None
+    # Sustained (>breach_margin_pct beyond the band edge, for
+    # breach_sustain_days consecutive runs) sleeve breaches — advisory only,
+    # never a forced trade. Populated by core/orchestrator.py.
+    sleeve_band_breaches: list[SleeveBreachAdvisory] = field(default_factory=list)
 
 
 @dataclass
@@ -117,7 +137,6 @@ class Briefing:
     overnight_changes: list[OvernightChange]
     book: list[BookEntry]
     portfolio_health: PortfolioHealth
-    drift_warning: DriftStatus | None = None
     blocked: BlockedStatus | None = None
     unresearched_holdings: list[UnresearchedHolding] = field(default_factory=list)
 
@@ -146,7 +165,6 @@ def assemble_briefing(
     overnight_changes: list[OvernightChange],
     book: list[BookEntry],
     portfolio_health: PortfolioHealth,
-    drift: DriftStatus | None,
     unresearched_holdings: list[UnresearchedHolding] | None = None,
 ) -> Briefing:
     return Briefing(
@@ -157,7 +175,6 @@ def assemble_briefing(
         book=sort_book_by_attention(book),
         portfolio_health=portfolio_health,
         unresearched_holdings=sorted(unresearched_holdings or [], key=lambda u: u.ticker),
-        drift_warning=drift if (drift is not None and drift.stale) else None,
     )
 
 
@@ -179,9 +196,34 @@ def assemble_blocked_briefing(
         overnight_changes=[],
         book=[],
         portfolio_health=PortfolioHealth(),
-        drift_warning=None,
         blocked=BlockedStatus(reason=reason, unpriced_positions=unpriced),
     )
+
+
+def order_sentence(o: OrderProposal) -> str:
+    """"Sell 1 share of AMD at $503.21 (limit order)" — the same phrasing the
+    UI uses (ui/src/lib/orderText.ts). Numbers spelled out, no ticket
+    shorthand."""
+    verb = "Sell" if o.action == "SELL" else "Buy"
+    qty = f"{o.quantity:g}"
+    unit = "share" if o.quantity == 1 else "shares"
+    order_type = " (limit order)" if o.order_type.upper() == "LIMIT" else ""
+    return f"{verb} {qty} {unit} of {o.ticker} at ${o.limit_price:,.2f}{order_type}"
+
+
+def order_context(o: OrderProposal) -> str:
+    parts = [f"About ${o.estimated_cost_usd:,.0f}, {o.weight_pct:.1f}% of your portfolio."]
+    if o.is_trim:
+        parts.append("A partial sell: you keep the rest of the position.")
+    return " ".join(parts)
+
+
+def format_age(days: float) -> str:
+    """"14h" under a day, "3d" from a day up — a reused score from last
+    night's run is hours old, not "0d"."""
+    if days < 1:
+        return f"{max(1, round(days * 24))}h"
+    return f"{round(days)}d"
 
 
 def render_briefing_text(briefing: Briefing) -> str:
@@ -212,28 +254,13 @@ def render_briefing_text(briefing: Briefing) -> str:
         )
         lines.append("")
 
-    if briefing.drift_warning is not None:
-        d = briefing.drift_warning
-        if d.last_import_at is None:
-            lines.append("⚠ DRIFT WARNING: positions have never been imported from a broker CSV.")
-        else:
-            lines.append(
-                f"⚠ DRIFT WARNING: last import was {d.days_since_import:.1f} days ago "
-                f"(threshold {d.threshold_days} days). Positions may be stale."
-            )
-        lines.append("")
-
     lines.append("--- Actions today ---")
     if not briefing.actions_today:
         lines.append("(none)")
     for item in briefing.actions_today:
         o = item.order
-        trim_note = " (trim)" if o.is_trim else ""
-        lines.append(
-            f"{o.action:<5} {o.ticker:<6} {o.quantity} shares   {o.order_type} ${o.limit_price:.2f}   "
-            f"~${o.estimated_cost_usd:,.0f}   ({o.weight_pct:.1f}% of NAV){trim_note}"
-        )
-        lines.append(f"      Conviction {o.conviction:.0f} · {item.headline}")
+        lines.append(order_sentence(o))
+        lines.append(f"      {order_context(o)} Conviction {o.conviction:.0f} out of 100. {item.headline}.")
         if item.thesis_summary:
             lines.append(f"      Why: {item.thesis_summary}")
         if item.bear_case:
@@ -259,7 +286,9 @@ def render_briefing_text(briefing: Briefing) -> str:
     if not briefing.book:
         lines.append("(no open positions)")
     for b in briefing.book:
-        if b.conviction_now is not None and b.conviction_at_entry is not None:
+        if b.conviction_now is not None and b.conviction_age_days is not None:
+            conv = f"conviction {b.conviction_now:.0f} (from run {b.conviction_run_id}, {format_age(b.conviction_age_days)} old)"
+        elif b.conviction_now is not None and b.conviction_at_entry is not None:
             conv = f"conviction {b.conviction_now:.0f} (was {b.conviction_at_entry:.0f})"
         elif b.conviction_now is not None:
             # a real fresh score exists this run, just no recorded entry

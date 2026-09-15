@@ -3,7 +3,6 @@ import pytest
 from sources.prices import (
     Bar,
     atr_percentile,
-    bars_from_fmp,
     compute_technical_snapshot,
     price_vs_ma_pct,
     relative_strength_pct,
@@ -18,17 +17,6 @@ def make_bars(closes, high_offset=1.0, low_offset=1.0):
         Bar(date=f"2026-01-{i+1:02d}", open=c, high=c + high_offset, low=c - low_offset, close=c, volume=1000)
         for i, c in enumerate(closes)
     ]
-
-
-class TestBarsFromFmp:
-    def test_sorts_newest_first_payload_into_chronological_order(self):
-        raw = [
-            {"date": "2026-08-24", "open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 100},
-            {"date": "2026-08-22", "open": 1, "high": 2, "low": 0.5, "close": 1.4, "volume": 100},
-            {"date": "2026-08-23", "open": 1, "high": 2, "low": 0.5, "close": 1.45, "volume": 100},
-        ]
-        bars = bars_from_fmp(raw)
-        assert [b.date for b in bars] == ["2026-08-22", "2026-08-23", "2026-08-24"]
 
 
 class TestSma:

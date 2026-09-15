@@ -125,23 +125,6 @@ class TestFMPClientBasics:
         with pytest.raises(BudgetExceeded):
             client.get_quote("NVDA")
 
-    def test_historical_prices_returns_bare_list(self, tmp_path):
-        client, session = make_client(
-            tmp_path,
-            {"historical-price-eod/full": FakeResponse(payload=[{"date": "2026-08-24", "close": 168.5}])},
-        )
-        rows = client.get_historical_prices("AMD")
-        assert rows == [{"date": "2026-08-24", "close": 168.5}]
-
-    def test_historical_prices_unwraps_legacy_dict_shape_too(self, tmp_path):
-        # defensive: tolerate the old v3 {"historical": [...]} shape if it ever appears
-        client, session = make_client(
-            tmp_path,
-            {"historical-price-eod/full": FakeResponse(payload={"historical": [{"date": "2026-08-24", "close": 168.5}]})},
-        )
-        rows = client.get_historical_prices("AMD")
-        assert rows == [{"date": "2026-08-24", "close": 168.5}]
-
     def test_insider_trading_uses_symbol_query_param(self, tmp_path):
         client, session = make_client(
             tmp_path, {"insider-trading": FakeResponse(payload=[{"symbol": "AMD", "transactionType": "S-Sale"}])}

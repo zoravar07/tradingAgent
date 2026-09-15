@@ -57,7 +57,6 @@ BASE_URL = "https://financialmodelingprep.com/stable"
 TTL_PROFILE = 7 * 24 * 3600
 TTL_QUOTE = 20 * 3600
 TTL_FUNDAMENTALS = 30 * 24 * 3600
-TTL_HISTORICAL_PRICES = 20 * 3600
 TTL_EARNINGS = 7 * 24 * 3600
 TTL_ANALYST = 3 * 24 * 3600
 TTL_OWNERSHIP_13F = 30 * 24 * 3600
@@ -143,22 +142,6 @@ class FMPClient:
             params={"symbol": ticker, "period": period, "limit": limit},
             ttl_seconds=TTL_FUNDAMENTALS,
         ) or []
-
-    # --------------------------------------------------------------- prices
-
-    def get_historical_prices(
-        self, ticker: str, from_date: str | None = None, to_date: str | None = None
-    ) -> list[dict]:
-        params = {"symbol": ticker}
-        if from_date:
-            params["from"] = from_date
-        if to_date:
-            params["to"] = to_date
-        data = self._get("historical-price-eod/full", params=params, ttl_seconds=TTL_HISTORICAL_PRICES)
-        # stable API returns a bare list, not {"historical": [...]} like the old v3 shape
-        if isinstance(data, dict):
-            return data.get("historical", [])
-        return data or []
 
     # -------------------------------------------------------------- earnings
 

@@ -1,21 +1,21 @@
-"""FMP historicals → ATR, moving averages, relative strength — §4's
-`sources/prices.py`, feeding §5.1 Stage 1's "price vs 50/200 DMA · relative
-strength vs sector ETF and SPY · ATR percentile".
+"""Bars → ATR, moving averages, relative strength — §4's `sources/prices.py`,
+feeding §5.1 Stage 1's "price vs 50/200 DMA · relative strength vs sector ETF
+and SPY · ATR percentile".
 
-Everything below the `Bar` parsing is a pure function over plain float
-sequences — no I/O, no FMPClient dependency — so it's testable with
-hand-built price series and doesn't need network mocking. `fetch_bars` is the
-only piece that talks to FMPClient; sector-ETF-per-ticker mapping is left to
-the screener (step 4) to supply, since that's a universe/config concern, not
-a pricing-math one.
+Everything below is a pure function over plain float sequences — no I/O, no
+network client dependency — so it's testable with hand-built price series and
+doesn't need network mocking. Bars themselves come from
+sources/yfinance_source.py's `YFinanceClient.get_historical_bars` (FMP's
+historical-price-eod endpoint was dropped once yfinance proved to cover every
+ticker for free — see sources/live_gateway.py's module docstring). Sector-ETF-
+per-ticker mapping is left to the screener (step 4) to supply, since that's a
+universe/config concern, not a pricing-math one.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Sequence
-
-from sources.fmp import FMPClient
 
 
 @dataclass(frozen=True)
@@ -26,27 +26,6 @@ class Bar:
     low: float
     close: float
     volume: float
-
-
-def bars_from_fmp(historical: list[dict]) -> list[Bar]:
-    """FMP's historical-price-full payload is newest-first; return oldest-first
-    so every function below can assume chronological order."""
-    bars = [
-        Bar(
-            date=row["date"],
-            open=float(row["open"]),
-            high=float(row["high"]),
-            low=float(row["low"]),
-            close=float(row["close"]),
-            volume=float(row.get("volume", 0)),
-        )
-        for row in historical
-    ]
-    return sorted(bars, key=lambda b: b.date)
-
-
-def fetch_bars(client: FMPClient, ticker: str, from_date: str | None = None, to_date: str | None = None) -> list[Bar]:
-    return bars_from_fmp(client.get_historical_prices(ticker, from_date=from_date, to_date=to_date))
 
 
 # ------------------------------------------------------------- pure math

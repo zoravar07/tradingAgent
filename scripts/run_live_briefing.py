@@ -56,6 +56,7 @@ from core.db import init_db, make_engine, make_session_factory  # noqa: E402
 from core.llm import LLMClient, MonthlySpendTracker  # noqa: E402
 from core.orchestrator import NightlyRunInputs, holdings_due_for_refresh, resolve_universe, run_nightly  # noqa: E402
 from core.portfolio import PortfolioService  # noqa: E402
+from core.sleeves import find_sleeve_drift  # noqa: E402
 from sources.fmp import FMPClient  # noqa: E402
 from sources.ibkr_flex import FlexError, FlexWebServiceClient, sync_positions  # noqa: E402
 from sources.index_constituents import SP500ConstituentsSource  # noqa: E402
@@ -103,6 +104,13 @@ def main() -> None:
     if not held_positions:
         print("WARNING: the broker reports no USD equity positions; the run will screen new names only.", file=sys.stderr)
     held_tickers = [p.ticker for p in held_positions]
+
+    drift = find_sleeve_drift([(p.ticker, p.sleeve) for p in held_positions], config.sleeves)
+    for d in drift:
+        logging.getLogger(__name__).warning(
+            "sleeve drift: %s stored as %s but config now resolves it to %s",
+            d.ticker, d.stored_sleeve, d.resolved_sleeve,
+        )
 
     fmp_cache = FileCache(ROOT / "data" / "cache")
     fmp_budget = DailyCallBudget(ROOT / "data" / "fmp_call_budget.json", daily_limit=250)

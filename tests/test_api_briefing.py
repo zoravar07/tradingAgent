@@ -40,8 +40,7 @@ def seed_run_with_briefing(session_factory, status="succeeded", created_at=NOW):
         watching=[], overnight_changes=[],
         book=[BookEntry(ticker="AMD", qty=3.5, value_usd=1681.0, weight_pct=13.7, unrealized_pnl_pct=132.5)],
         portfolio_health=PortfolioHealth(cash_pct=0.3),
-        drift=None,
-    )
+            )
     session.add(BriefingRecord(run_id=run.id, briefing_json=serialize_briefing(briefing), created_at=created_at))
     session.commit()
     session.close()
@@ -98,3 +97,31 @@ class TestCors:
         client, _ = make_client(tmp_path)
         resp = client.get("/api/health", headers={"Origin": "http://localhost:5173"})
         assert resp.headers.get("access-control-allow-origin") == "http://localhost:5173"
+
+
+class TestSleeveDriftStartupCheck:
+    def test_startup_logs_sleeve_drift(self, tmp_path, caplog):
+        import logging as _logging
+
+        import yaml
+
+        from core.config import Config
+        from core.portfolio import PortfolioService
+
+        db_path = tmp_path / "t.db"
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.safe_dump(Config().model_dump(mode="json")))
+
+        engine = make_engine(db_path)
+        init_db(engine)
+        session = make_session_factory(engine)()
+        portfolio = PortfolioService(session, config=Config().portfolio, sleeves=Config().sleeves)
+        portfolio.add_manual_position("VTI", qty=1, avg_cost=300.0, opened_at=dt.datetime(2026, 1, 1))
+        portfolio.reclassify_sleeve(portfolio.get_position("VTI").id, "SWING")  # force a mismatch
+        session.commit()
+        session.close()
+
+        with caplog.at_level(_logging.WARNING):
+            create_app(db_path=db_path, config_path=config_path, data_dir=tmp_path)
+
+        assert any("sleeve drift" in r.message and "VTI" in r.message for r in caplog.records)

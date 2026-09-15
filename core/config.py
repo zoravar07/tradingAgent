@@ -116,14 +116,31 @@ class RiskConfig(BaseModel):
     reference_atr_pct_of_price: float = 3.0
     min_volatility_size_multiplier: float = 0.25
     thesis_decay_trigger_pts: float = 15.0
-    # User-requested, not in the spec: every other exit trigger needs
-    # either price movement (trailing stop, profit band) or a recorded
-    # entry conviction to compare against (thesis decay) — a position
-    # that's simply bad, with no baseline and no favorable price action,
-    # never triggers anything under those three alone. This is an absolute
-    # floor: conviction_now below this always proposes an exit for a held
-    # position, regardless of P&L or whether an entry baseline exists.
-    min_hold_conviction: float = 40.0
+    # C_enter / C_exit — user-requested recalibration of the portfolio
+    # framework document's conviction bands (2026-09-15 decision). The
+    # framework doc specifies C_enter 65 / C_exit 55, but those don't match
+    # what the scorer actually produces: Run 8's best new candidate scored
+    # only 60.8 (would fail a 65 entry bar on the single best name
+    # available), and eight of the current holdings sit below 55 (would all
+    # get sold, and nothing would ever qualify to replace them). Using
+    # C_enter 58 / C_exit 42 instead — both numbers should be revisited
+    # once there's an actual track record showing whether the conviction
+    # score predicts anything, not adjusted again by feel.
+    #
+    # C_enter: a new-BUY candidate below this conviction is never sized at
+    # all (rejected before size_new_position runs, and before it can
+    # consume one of the day's max_daily_proposals slots).
+    conviction_enter_floor: float = 58.0
+    # C_exit: same mechanism as before sleeves existed (min_hold_conviction)
+    # — every other held-SWING exit trigger needs either price movement
+    # (trailing stop, profit band) or a recorded entry conviction to
+    # compare against (thesis decay); a position that's simply bad, with no
+    # baseline and no favorable price action, never triggers anything under
+    # those three alone. This is an absolute floor: conviction_now below
+    # this always proposes an exit for a held SWING position, regardless of
+    # P&L or whether an entry baseline exists. (CORE/HEDGE_CASH/SPECULATIVE
+    # don't use this at all — see core/risk_rules.py's sleeve gating.)
+    min_hold_conviction: float = 42.0
     # User-requested hard gate, not in the spec: NAV is only as good as
     # every held position being priced. Zero tolerance by default — if more
     # than this many held positions can't be priced, the whole run halts

@@ -9,6 +9,7 @@ from core.risk_rules import (
     evaluate_held_position,
     hard_stop_breached,
     lerp_by_conviction,
+    meets_entry_floor,
     profit_band_crossed,
     size_new_position,
     size_speculative_position,
@@ -79,6 +80,17 @@ class TestVolatilityMultiplier:
     def test_none_or_zero_atr_treated_as_no_adjustment(self):
         assert volatility_size_multiplier(None, RISK) == 1.0
         assert volatility_size_multiplier(0, RISK) == 1.0
+
+
+class TestMeetsEntryFloor:
+    def test_below_c_enter_rejected(self):
+        assert meets_entry_floor(57.9, RISK) is False
+
+    def test_at_c_enter_accepted(self):
+        assert meets_entry_floor(58.0, RISK) is True
+
+    def test_above_c_enter_accepted(self):
+        assert meets_entry_floor(60.8, RISK) is True  # Run 8's best new candidate
 
 
 class TestSizeNewPosition:
@@ -455,7 +467,7 @@ class TestEvaluateHeldPosition:
             avg_cost=218,
             peak_price=241,
             atr_14=50.0,  # huge ATR so trailing stop doesn't also fire
-            conviction_now=40,
+            conviction_now=45,  # >= min_hold_conviction (42), but still a >=15pt drop from entry
             conviction_at_entry=68,
             scaling=SCALING,
             config=RISK,
@@ -481,7 +493,7 @@ class TestEvaluateHeldPosition:
     def test_conviction_floor_does_not_fire_at_or_above_threshold(self):
         evaluation = evaluate_held_position(
             ticker="AMD", current_price=105, avg_cost=100, peak_price=106, atr_14=2.0,
-            conviction_now=40.0, conviction_at_entry=None, scaling=SCALING, config=RISK,
+            conviction_now=RISK.min_hold_conviction, conviction_at_entry=None, scaling=SCALING, config=RISK,
         )
         assert evaluation.has_exit_signal is False
 

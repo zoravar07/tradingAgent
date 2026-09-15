@@ -81,6 +81,7 @@ from core.risk_rules import (
     check_kill_switches,
     enforce_daily_proposal_cap,
     evaluate_held_position,
+    meets_entry_floor,
     size_new_position,
     size_speculative_position,
     update_peak_price,
@@ -635,6 +636,14 @@ def _run_pipeline(session, config, gateway, llm, portfolio, inputs, run_row, new
     if not kill_status.triggered:
         for ticker, conviction in conviction_by_ticker.items():
             if ticker in held_set:
+                continue
+            # C_enter gate — rejected here, before it can consume one of
+            # the day's max_daily_proposals slots, not just before sizing.
+            if not meets_entry_floor(conviction, config.risk):
+                session.add(RiskEvent(
+                    run_id=run_row.id, type="BELOW_ENTRY_FLOOR",
+                    detail_json=json.dumps({"ticker": ticker, "conviction": conviction, "c_enter": config.risk.conviction_enter_floor}),
+                ))
                 continue
             new_proposals.append(ScoredProposal(ticker=ticker, conviction=conviction))
     capped = enforce_daily_proposal_cap(new_proposals, config.risk)

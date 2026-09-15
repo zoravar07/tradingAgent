@@ -124,13 +124,23 @@ risk:
   # silently zeroed out part of NAV. Zero tolerance: any held position that
   # can't be priced halts the whole run rather than publish on a broken NAV.
   max_unpriced_held_positions: 0
-  # Not in the spec — added after a live run where RKLB (conviction 36) and
-  # MP (38) generated no proposal despite memos describing accelerating
-  # cash burn: they had no entry baseline (thesis decay can't fire) and
-  # hadn't dropped in price (no trailing stop/profit band either). A
-  # position below this conviction always gets a proposed exit, regardless
-  # of P&L or whether an entry baseline exists.
-  min_hold_conviction: 40.0
+  # C_enter / C_exit — user-requested recalibration of the portfolio
+  # framework document's conviction bands (2026-09-15 decision). The
+  # framework doc specifies C_enter 65 / C_exit 55, but those don't match
+  # what the scorer actually produces: Run 8's best new candidate scored
+  # only 60.8, and eight current holdings sit below 55 — those numbers
+  # would sell most of the book and never buy anything again. Revisit both
+  # once there's an actual track record showing the conviction score
+  # predicts something, not by feel.
+  conviction_enter_floor: 58.0  # C_enter: a new-BUY candidate below this is never sized at all
+  # C_exit (was min_hold_conviction, added after a live run where RKLB
+  # (conviction 36) and MP (38) generated no proposal despite memos
+  # describing accelerating cash burn: no entry baseline (thesis decay
+  # can't fire), hadn't dropped in price (no trailing stop/profit band
+  # either)). A held SWING position below this always gets a proposed
+  # exit, regardless of P&L or entry baseline. Not used by CORE/HEDGE_CASH/
+  # SPECULATIVE — see core/risk_rules.py's sleeve gating.
+  min_hold_conviction: 42.0
 
 conviction_weights:                 # auto-normalised; add or remove freely
   business_quality: 0.15

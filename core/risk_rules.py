@@ -120,6 +120,15 @@ def volatility_size_multiplier(atr_pct_of_price: float | None, config: RiskConfi
     return max(config.min_volatility_size_multiplier, min(1.0, raw))
 
 
+def meets_entry_floor(conviction_score: float, config: RiskConfig) -> bool:
+    """C_enter (user-recalibrated, 2026-09-15 — see config.yaml's
+    conviction_enter_floor comment for why 58 rather than the framework
+    doc's 65): a new-BUY candidate below this conviction is never sized at
+    all — rejected before size_new_position runs and before it can consume
+    one of the day's max_daily_proposals slots."""
+    return conviction_score >= config.conviction_enter_floor
+
+
 def size_new_position(
     conviction_score: float,
     atr_pct_of_price: float | None,

@@ -307,6 +307,44 @@ class TestSleeveWiring:
         assert rklb_entry.oversized_speculative is False
 
 
+class TestCEnterGate:
+    def test_new_candidate_below_c_enter_gets_no_buy(self, session, portfolio, tmp_path):
+        gateway = FakeGateway(
+            inputs={"AMD": screener_input("AMD", technical=technical(relative_strength_vs_spy_pct=5))},
+            prices={"AMD": 150.0},
+        )
+        script = [
+            ranking(("AMD", 90)),
+            FakeResponse(parsed_output=memo(subscore=55.0)),  # below C_enter (58)
+        ]
+        llm = make_llm(tmp_path, script)
+        config = make_config()
+        run_inputs = NightlyRunInputs(
+            as_of=dt.datetime(2026, 9, 1), universe_tickers=["AMD"], held_tickers=[], cash=usd(100_000.0)
+        )
+        briefing = run_nightly(session=session, config=config, gateway=gateway, llm=llm, portfolio=portfolio, inputs=run_inputs)
+        assert briefing.actions_today == []
+        events = session.execute(select(RiskEvent).where(RiskEvent.type == "BELOW_ENTRY_FLOOR")).scalars().all()
+        assert len(events) == 1
+
+    def test_new_candidate_at_or_above_c_enter_gets_a_buy(self, session, portfolio, tmp_path):
+        gateway = FakeGateway(
+            inputs={"AMD": screener_input("AMD", technical=technical(relative_strength_vs_spy_pct=5))},
+            prices={"AMD": 150.0},
+        )
+        script = [
+            ranking(("AMD", 90)),
+            FakeResponse(parsed_output=memo(subscore=70.0)),  # comfortably above C_enter (58)
+        ]
+        llm = make_llm(tmp_path, script)
+        config = make_config()
+        run_inputs = NightlyRunInputs(
+            as_of=dt.datetime(2026, 9, 1), universe_tickers=["AMD"], held_tickers=[], cash=usd(100_000.0)
+        )
+        briefing = run_nightly(session=session, config=config, gateway=gateway, llm=llm, portfolio=portfolio, inputs=run_inputs)
+        assert [a.order.ticker for a in briefing.actions_today] == ["AMD"]
+
+
 class TestFullNightlyRun:
     def test_end_to_end(self, session, portfolio, tmp_path):
         # --- held position, matching §3's NBIS example
@@ -723,7 +761,11 @@ class TestConvictionFloorIntegration:
         )
         script = [
             ranking(("MRVL", 60)),
-            FakeResponse(parsed_output=memo(subscore=40.0)),  # exactly at the floor
+            # Safely above the floor (42.0), not exactly at it — a uniform
+            # subscore's weighted rollup can land a hair under the input
+            # value (float summation of the weights), e.g. 41.999999999999
+            # for subscore=42.0, which would trigger CONVICTION_FLOOR.
+            FakeResponse(parsed_output=memo(subscore=45.0)),
         ]
         llm = make_llm(tmp_path, script)
         config = make_config()

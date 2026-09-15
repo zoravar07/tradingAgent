@@ -8,7 +8,6 @@ SAMPLE_YAML = """\
 version: 1
 
 portfolio:
-  import_reminder_days: 7
   # this comment must survive a write that doesn't touch allow_fractional
   allow_fractional: true
 
@@ -91,7 +90,7 @@ class TestRoundTrip:
         path.write_text("version: 1\n")  # nothing else present
         raw = read_raw(path)
         snap = editable_snapshot(raw)
-        assert snap["risk"]["min_hold_conviction"] == 40.0  # RiskConfig()'s own default
+        assert snap["risk"]["min_hold_conviction"] == 42.0  # RiskConfig()'s own default
 
 
 class TestDefaultValues:

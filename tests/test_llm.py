@@ -1,6 +1,7 @@
 """LLMClient tests — the Anthropic client is fake throughout. No test in this
 file may call a real Anthropic API or spend real budget."""
 
+import json
 from dataclasses import dataclass
 
 import pytest
@@ -13,6 +14,7 @@ from core.llm import (
     MonthlySpendTracker,
     UnknownModelPricing,
     estimate_cost_usd,
+    web_search_tool,
 )
 
 
@@ -33,19 +35,67 @@ class FakeResponse:
         self.usage = FakeUsage(input_tokens, output_tokens)
 
 
+@dataclass
+class FakeServerToolUse:
+    web_search_requests: int = 0
+
+
+@dataclass
+class FakeUsageWithSearch:
+    input_tokens: int
+    output_tokens: int
+    server_tool_use: FakeServerToolUse | None = None
+
+
+@dataclass
+class FakeCitation:
+    url: str
+    title: str = ""
+    type: str = "web_search_result_location"
+
+
+class FakeTextBlock:
+    def __init__(self, text: str, citations: list | None = None):
+        self.type = "text"
+        self.text = text
+        self.citations = citations
+
+
+class FakeServerToolUseBlock:
+    """A server_tool_use block — present in real web-search responses and
+    must be ignored (not read as text) by the client."""
+
+    type = "server_tool_use"
+
+
+class FakeTextResponse:
+    def __init__(self, blocks: list, stop_reason: str = "end_turn", input_tokens=100, output_tokens=20, web_search_requests=0):
+        self.content = blocks
+        self.stop_reason = stop_reason
+        self.usage = FakeUsageWithSearch(input_tokens, output_tokens, FakeServerToolUse(web_search_requests))
+
+
 class FakeMessages:
-    """Serves a scripted sequence of responses/exceptions, one per .parse() call."""
+    """Serves a scripted sequence of responses/exceptions, one per .parse()
+    or .create() call, in order — a test scripting both kinds lists them in
+    the order the code under test issues them."""
 
     def __init__(self, script: list):
         self.script = list(script)
         self.calls: list[dict] = []
 
-    def parse(self, **kwargs):
+    def _next(self, kwargs):
         self.calls.append(kwargs)
         item = self.script.pop(0)
         if isinstance(item, Exception):
             raise item
         return item
+
+    def parse(self, **kwargs):
+        return self._next({**kwargs, "_method": "parse"})
+
+    def create(self, **kwargs):
+        return self._next({**kwargs, "_method": "create"})
 
 
 class FakeClient:
@@ -100,6 +150,16 @@ class TestMonthlySpendTracker:
         MonthlySpendTracker(path, 40.0, month_fn=lambda: "2026-08").record(7.5)
         second = MonthlySpendTracker(path, 40.0, month_fn=lambda: "2026-08")
         assert second.spent_this_month() == 7.5
+
+    def test_recording_in_a_new_month_does_not_erase_prior_months(self, tmp_path):
+        path = tmp_path / "spend.json"
+        month = {"value": "2026-08"}
+        tracker = MonthlySpendTracker(path, 40.0, month_fn=lambda: month["value"])
+        tracker.record(12.0)
+        month["value"] = "2026-09"
+        tracker.record(3.0)
+        raw = json.loads(path.read_text())
+        assert raw == {"2026-08": 12.0, "2026-09": 3.0}
 
 
 class TestLLMClientCallStructured:
@@ -174,3 +234,85 @@ class TestLLMClientCallStructured:
         llm.call_structured(model="claude-haiku-4-5", system="s", user_message="m", output_model=Verdict, max_retries=1)
 
         assert tracker.spent_this_month() > 0
+
+
+class TestEstimateCostWebSearch:
+    def test_web_searches_are_billed_at_one_cent_each(self):
+        base = estimate_cost_usd("claude-sonnet-4-6", 1000, 100)
+        with_search = estimate_cost_usd("claude-sonnet-4-6", 1000, 100, web_search_requests=3)
+        assert with_search == pytest.approx(base + 0.03)
+
+
+WEB_SEARCH_TOOL = {"type": "web_search_20260209", "name": "web_search", "max_uses": 3}
+
+
+class TestLLMClientCallText:
+    def test_concatenates_text_blocks_and_collects_citation_urls(self, tmp_path):
+        response = FakeTextResponse(
+            [
+                FakeServerToolUseBlock(),
+                FakeTextBlock("2026-09-08: AMD raised guidance. ", [FakeCitation("https://example.com/a")]),
+                FakeTextBlock("Analysts reacted. ", [FakeCitation("https://example.com/b"), FakeCitation("https://example.com/a")]),
+            ],
+            web_search_requests=2,
+        )
+        llm = LLMClient(FakeClient([response]), make_tracker(tmp_path))
+
+        result = llm.call_text(model="claude-sonnet-4-6", system="s", user_message="m", tools=[WEB_SEARCH_TOOL])
+
+        assert result.text == "2026-09-08: AMD raised guidance. Analysts reacted. "
+        assert result.source_urls == ["https://example.com/a", "https://example.com/b"]  # ordered, de-duplicated
+        assert result.usage.web_search_requests == 2
+        assert result.usage.cost_usd == pytest.approx(estimate_cost_usd("claude-sonnet-4-6", 100, 20, web_search_requests=2))
+
+    def test_passes_tools_through_and_uses_create_not_parse(self, tmp_path):
+        client = FakeClient([FakeTextResponse([FakeTextBlock("hi")])])
+        llm = LLMClient(client, make_tracker(tmp_path))
+        llm.call_text(model="claude-sonnet-4-6", system="s", user_message="m", tools=[WEB_SEARCH_TOOL])
+        call = client.messages.calls[0]
+        assert call["_method"] == "create"
+        assert call["tools"] == [WEB_SEARCH_TOOL]
+        assert "output_format" not in call  # plain text: structured outputs and web-search citations don't mix
+
+    def test_records_search_cost_against_budget(self, tmp_path):
+        tracker = make_tracker(tmp_path)
+        llm = LLMClient(FakeClient([FakeTextResponse([FakeTextBlock("x")], web_search_requests=4)]), tracker)
+        llm.call_text(model="claude-sonnet-4-6", system="s", user_message="m", tools=[WEB_SEARCH_TOOL])
+        assert tracker.spent_this_month() >= 0.04
+
+    def test_continues_after_pause_turn_by_resending_assistant_content(self, tmp_path):
+        first = FakeTextResponse([FakeServerToolUseBlock()], stop_reason="pause_turn", web_search_requests=1)
+        second = FakeTextResponse([FakeTextBlock("done", [FakeCitation("https://example.com/z")])], web_search_requests=1)
+        client = FakeClient([first, second])
+        llm = LLMClient(client, make_tracker(tmp_path))
+
+        result = llm.call_text(model="claude-sonnet-4-6", system="s", user_message="m", tools=[WEB_SEARCH_TOOL])
+
+        assert result.text == "done"
+        assert result.usage.web_search_requests == 2  # both legs billed
+        second_call = client.messages.calls[1]
+        assert second_call["messages"][1]["role"] == "assistant"
+        assert second_call["messages"][1]["content"] is first.content  # sent back unchanged, encrypted results intact
+
+    def test_no_text_blocks_is_an_error_after_retries(self, tmp_path):
+        client = FakeClient([FakeTextResponse([FakeServerToolUseBlock()]), FakeTextResponse([FakeServerToolUseBlock()])])
+        llm = LLMClient(client, make_tracker(tmp_path))
+        with pytest.raises(LLMError):
+            llm.call_text(model="claude-sonnet-4-6", system="s", user_message="m", tools=[WEB_SEARCH_TOOL], max_retries=1)
+
+    def test_refuses_to_call_when_budget_already_exceeded(self, tmp_path):
+        tracker = make_tracker(tmp_path, cap=1.0)
+        tracker.record(1.0)
+        client = FakeClient([FakeTextResponse([FakeTextBlock("x")])])
+        with pytest.raises(MonthlyBudgetExceeded):
+            LLMClient(client, tracker).call_text(model="claude-sonnet-4-6", system="s", user_message="m")
+        assert client.messages.calls == []
+
+
+class TestWebSearchToolForModel:
+    def test_basic_variant_for_every_model(self):
+        # Measured live 2026-09-09: the dynamic-filtering variant took 416s
+        # and ~$0.97 for one digest and returned no citation URLs. Basic
+        # answered in ~5s with citations. See core/llm.py.
+        for model in ("claude-sonnet-4-6", "claude-haiku-4-5", "some-future-model"):
+            assert web_search_tool(model, max_uses=3) == {"type": "web_search_20250305", "name": "web_search", "max_uses": 3}

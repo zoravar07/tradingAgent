@@ -6,16 +6,19 @@ import pytest
 from agents.research import (
     BearCase,
     Catalyst,
+    NO_MATERIAL_NEWS_MARKER,
+    NewsDigest,
     RESEARCH_SUBSCORE_NAMES,
     ResearchContext,
     ResearchMemo,
     Subscore,
+    run_news_digest,
     run_research,
     run_research_batch,
 )
 from core.config import ResearchConfig
 from core.llm import LLMClient, MonthlySpendTracker
-from tests.test_llm import FakeClient, FakeResponse
+from tests.test_llm import FakeCitation, FakeClient, FakeResponse, FakeTextBlock, FakeTextResponse
 
 
 def make_llm(tmp_path, script):
@@ -184,3 +187,92 @@ class TestRunResearchBatch:
         contexts = [ResearchContext("AMD", "x"), ResearchContext("BAD", "y"), ResearchContext("NVDA", "z")]
         results = run_research_batch(llm, contexts, CONFIG)
         assert [r.ok for r in results] == [True, False, True]
+
+
+class TestRunNewsDigest:
+    def test_sourced_text_is_news(self, tmp_path):
+        response = FakeTextResponse(
+            [FakeTextBlock("2026-09-08: AMD raised FY guidance at its analyst day.", [FakeCitation("https://example.com/amd")])],
+            web_search_requests=2,
+        )
+        llm = make_llm(tmp_path, [response])
+        digest = run_news_digest(llm, "AMD", ResearchConfig())
+
+        assert digest.ok is True
+        assert digest.found_news is True
+        assert digest.source_urls == ["https://example.com/amd"]
+        assert "raised FY guidance" in digest.text
+        assert digest.usage.web_search_requests == 2
+
+    def test_no_material_news_marker_is_not_news(self, tmp_path):
+        llm = make_llm(tmp_path, [FakeTextResponse([FakeTextBlock(NO_MATERIAL_NEWS_MARKER)])])
+        digest = run_news_digest(llm, "AMD", ResearchConfig())
+        assert digest.ok is True
+        assert digest.found_news is False
+
+    def test_text_without_any_source_url_is_not_news(self, tmp_path):
+        # The whole point: an unsourced claim is treated as no news, never shown.
+        llm = make_llm(tmp_path, [FakeTextResponse([FakeTextBlock("AMD announced record revenue of $18.1B.")])])
+        digest = run_news_digest(llm, "AMD", ResearchConfig())
+        assert digest.found_news is False
+        assert digest.source_urls == []
+
+    def test_uses_the_web_search_tool_with_the_configured_cap(self, tmp_path):
+        client = FakeClient([FakeTextResponse([FakeTextBlock(NO_MATERIAL_NEWS_MARKER)])])
+        llm = LLMClient(client, MonthlySpendTracker(tmp_path / "spend.json", 40.0, month_fn=lambda: "2026-08"))
+        run_news_digest(llm, "AMD", ResearchConfig(web_search_max_uses=2, news_lookback_days=10))
+        call = client.messages.calls[0]
+        assert call["tools"] == [{"type": "web_search_20250305", "name": "web_search", "max_uses": 2}]
+        assert call["model"] == "claude-haiku-4-5"  # digests run on the cheap model by default
+        assert "10 days" in call["messages"][0]["content"]
+        assert "AMD" in call["messages"][0]["content"]
+
+    def test_failure_surfaces_as_error_not_exception(self, tmp_path):
+        llm = make_llm(tmp_path, [RuntimeError("api down"), RuntimeError("api down"), RuntimeError("api down")])
+        digest = run_news_digest(llm, "AMD", ResearchConfig())
+        assert digest.ok is False
+        assert digest.found_news is False
+        assert "api down" in digest.error
+
+
+class TestResearchUsesDigest:
+    def test_digest_text_and_sources_land_in_the_memo_prompt(self, tmp_path):
+        client = FakeClient([FakeResponse(parsed_output=make_memo())])
+        llm = LLMClient(client, MonthlySpendTracker(tmp_path / "spend.json", 40.0, month_fn=lambda: "2026-08"))
+        digest = NewsDigest(ticker="AMD", text="2026-09-08: guidance raised.", source_urls=["https://example.com/amd"])
+        run_research(llm, ResearchContext(ticker="AMD", context_text="fundamentals", news_digest=digest), CONFIG)
+        prompt = client.messages.calls[0]["messages"][0]["content"]
+        assert "guidance raised" in prompt
+        assert "https://example.com/amd" in prompt
+
+    def test_without_digest_the_prompt_says_no_news_was_retrieved(self, tmp_path):
+        client = FakeClient([FakeResponse(parsed_output=make_memo())])
+        llm = LLMClient(client, MonthlySpendTracker(tmp_path / "spend.json", 40.0, month_fn=lambda: "2026-08"))
+        run_research(llm, ResearchContext(ticker="AMD", context_text="fundamentals"), CONFIG)
+        prompt = client.messages.calls[0]["messages"][0]["content"]
+        assert "no recent news was retrieved" in prompt.lower()
+
+
+class TestNewsDigestCache:
+    def test_second_call_within_window_is_served_from_cache(self, tmp_path):
+        from core.cache import FileCache
+
+        cache = FileCache(tmp_path / "news")
+        client = FakeClient([FakeTextResponse([FakeTextBlock("2026-09-08: guidance raised.", [FakeCitation("https://x/1")])], web_search_requests=1)])
+        llm = LLMClient(client, MonthlySpendTracker(tmp_path / "spend.json", 40.0, month_fn=lambda: "2026-08"))
+        first = run_news_digest(llm, "AMD", ResearchConfig(), cache=cache)
+        second = run_news_digest(llm, "AMD", ResearchConfig(), cache=cache)
+        assert first.cached is False and second.cached is True
+        assert second.text == first.text and second.source_urls == ["https://x/1"] and second.found_news
+        assert len(client.messages.calls) == 1
+
+    def test_failures_are_not_cached(self, tmp_path):
+        from core.cache import FileCache
+
+        cache = FileCache(tmp_path / "news")
+        llm = make_llm(tmp_path, [RuntimeError("down")] * 3 + [FakeTextResponse([FakeTextBlock(NO_MATERIAL_NEWS_MARKER)])])
+        assert run_news_digest(llm, "AMD", ResearchConfig(), cache=cache).ok is False
+        assert run_news_digest(llm, "AMD", ResearchConfig(), cache=cache).ok is True  # retried, not a cached failure
+
+    def test_default_is_one_search(self):
+        assert ResearchConfig().web_search_max_uses == 1

@@ -47,6 +47,16 @@ class FileCache:
             return None
         return entry.value
 
+    def peek(self, key: str) -> tuple[Any, float] | None:
+        """The stored value and its stored_at time regardless of TTL — for
+        read-only display of the last thing fetched (a chart of the bars the
+        last run priced against), never for deciding whether to refetch."""
+        path = self._path(key)
+        if not path.exists():
+            return None
+        raw = json.loads(path.read_text())
+        return raw["value"], float(raw["stored_at"])
+
     def set(self, key: str, value: Any, ttl_seconds: float) -> None:
         payload = CacheEntry(key=key, stored_at=time.time(), ttl_seconds=ttl_seconds, value=value)
         self._path(key).write_text(json.dumps(payload.__dict__))

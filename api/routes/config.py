@@ -48,7 +48,6 @@ def get_config_path(request: Request) -> Path:
 
 
 class PortfolioUpdate(BaseModel):
-    import_reminder_days: int = Field(ge=1, le=90)
     allow_fractional: bool
 
 

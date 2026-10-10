@@ -2,12 +2,14 @@ import pytest
 
 from agents.screener import (
     ScreenerInput,
+    Stage2Ranking,
     Stage2Result,
+    Stage2Score,
     Stage2Verdict,
+    describe_candidate,
     evaluate_stage1,
     run_stage1,
     run_stage2_batch,
-    run_stage2_triage,
     select_stage2_survivors,
     select_survivors,
 )
@@ -225,7 +227,7 @@ class TestSelectSurvivors:
 
 # -------------------------------------------------------------------- Stage 2
 
-STAGE2_CONFIG = Stage2Config()
+STAGE2_CONFIG = Stage2Config(max_survivors=2)
 
 
 def make_llm(tmp_path, script):
@@ -237,53 +239,56 @@ def stage1_result_for(ticker, is_held=False, rank_score=5.0):
     return run_stage1(items, DEFAULT_CONFIG)[0]
 
 
-class TestRunStage2Triage:
-    def test_material_verdict_passes_non_held(self, tmp_path):
-        llm = make_llm(tmp_path, [FakeResponse(parsed_output=Stage2Verdict(verdict="new contract win", material=True))])
-        result = run_stage2_triage(llm, stage1_result_for("AMD"), STAGE2_CONFIG)
-        assert result.passed is True
-        assert result.material is True
-        assert result.ok is True
+def ranking(*pairs):
+    return FakeResponse(parsed_output=Stage2Ranking(items=[Stage2Score(ticker=t, score=s, reason=f"{t} reason") for t, s in pairs]))
 
-    def test_non_material_verdict_fails_non_held(self, tmp_path):
-        llm = make_llm(tmp_path, [FakeResponse(parsed_output=Stage2Verdict(verdict="nothing new", material=False))])
-        result = run_stage2_triage(llm, stage1_result_for("AMD"), STAGE2_CONFIG)
-        assert result.passed is False
 
-    def test_held_position_passes_regardless_of_verdict(self, tmp_path):
-        llm = make_llm(tmp_path, [FakeResponse(parsed_output=Stage2Verdict(verdict="nothing new", material=False))])
-        result = run_stage2_triage(llm, stage1_result_for("AMD", is_held=True), STAGE2_CONFIG)
-        assert result.passed is True
-
-    def test_llm_failure_does_not_raise(self, tmp_path):
-        llm = make_llm(tmp_path, [RuntimeError("api down"), RuntimeError("still down"), RuntimeError("still down")])
-        result = run_stage2_triage(llm, stage1_result_for("AMD"), STAGE2_CONFIG)
-        assert result.ok is False
-        assert "api down" in result.error or "still down" in result.error
-        assert result.passed is False  # non-held, failed triage -> dropped
-
-    def test_llm_failure_on_held_position_still_passes(self, tmp_path):
-        llm = make_llm(tmp_path, [RuntimeError("api down"), RuntimeError("x"), RuntimeError("x")])
-        result = run_stage2_triage(llm, stage1_result_for("AMD", is_held=True), STAGE2_CONFIG)
-        assert result.ok is False
-        assert result.passed is True  # held positions always enter the pipeline (§5)
+class TestDescribeCandidate:
+    def test_one_line_of_numbers_only(self):
+        item = candidate("AMD", technical=snapshot(relative_strength_vs_spy_pct=12.5))
+        line = describe_candidate(item, run_stage1([item], DEFAULT_CONFIG)[0])
+        assert line.startswith("AMD: mcap $") and "RS vs SPY 63d +12.5%" in line and "\n" not in line
 
 
 class TestRunStage2Batch:
-    def test_one_call_per_candidate(self, tmp_path):
-        results = [
-            stage1_result_for("AMD"),
-            stage1_result_for("NVDA"),
-        ]
-        llm = make_llm(
-            tmp_path,
-            [
-                FakeResponse(parsed_output=Stage2Verdict(verdict="a", material=True)),
-                FakeResponse(parsed_output=Stage2Verdict(verdict="b", material=False)),
-            ],
-        )
-        batch = run_stage2_batch(llm, results, STAGE2_CONFIG)
-        assert [r.ticker for r in batch] == ["AMD", "NVDA"]
+    def test_one_call_ranks_all_non_held_and_shortlists_top_n(self, tmp_path):
+        results = [stage1_result_for("AMD"), stage1_result_for("NVDA"), stage1_result_for("XOM")]
+        client = FakeClient([ranking(("AMD", 80), ("NVDA", 90), ("XOM", 20))])
+        llm = LLMClient(client, MonthlySpendTracker(tmp_path / "spend.json", 40.0, month_fn=lambda: "2026-08"))
+        batch = run_stage2_batch(llm, results, STAGE2_CONFIG, {r.ticker: candidate(r.ticker) for r in results})
+        assert len(client.messages.calls) == 1  # one batched call, not one per name
+        assert "tools" not in client.messages.calls[0]  # no web search in Stage 2
+        assert "AMD: mcap" in client.messages.calls[0]["messages"][0]["content"]
+        by = {r.ticker: r for r in batch}
+        assert by["NVDA"].passed and by["AMD"].passed and not by["XOM"].passed
+        assert by["NVDA"].score == 90 and by["XOM"].material is False and by["XOM"].verdict == "XOM reason"
+
+    def test_held_names_skip_the_model_and_pass(self, tmp_path):
+        client = FakeClient([])
+        llm = LLMClient(client, MonthlySpendTracker(tmp_path / "spend.json", 40.0, month_fn=lambda: "2026-08"))
+        batch = run_stage2_batch(llm, [stage1_result_for("AMD", is_held=True)], STAGE2_CONFIG)
+        assert client.messages.calls == [] and batch[0].passed is True and batch[0].material is False
+
+    def test_failed_call_drops_non_held_without_raising(self, tmp_path):
+        llm = make_llm(tmp_path, [RuntimeError("api down"), RuntimeError("x"), RuntimeError("x")])
+        batch = run_stage2_batch(llm, [stage1_result_for("AMD"), stage1_result_for("NVDA", is_held=True)], STAGE2_CONFIG)
+        by = {r.ticker: r for r in batch}
+        assert by["AMD"].ok is False and by["AMD"].passed is False and by["AMD"].error  # last retry's error is kept
+        assert by["NVDA"].passed is True  # held positions always enter the pipeline (§5)
+
+    def test_ticker_missing_from_reply_is_dropped(self, tmp_path):
+        llm = make_llm(tmp_path, [ranking(("AMD", 70))])
+        batch = run_stage2_batch(llm, [stage1_result_for("AMD"), stage1_result_for("NVDA")], STAGE2_CONFIG)
+        by = {r.ticker: r for r in batch}
+        assert by["AMD"].passed and not by["NVDA"].passed and "missing" in by["NVDA"].error
+
+    def test_chunks_by_batch_size(self, tmp_path):
+        results = [stage1_result_for(f"T{i}") for i in range(5)]
+        client = FakeClient([ranking(("T0", 1), ("T1", 2), ("T2", 3)), ranking(("T3", 99), ("T4", 4))])
+        llm = LLMClient(client, MonthlySpendTracker(tmp_path / "spend.json", 40.0, month_fn=lambda: "2026-08"))
+        batch = run_stage2_batch(llm, results, Stage2Config(max_survivors=1, batch_size=3))
+        assert len(client.messages.calls) == 2
+        assert [r.ticker for r in batch if r.passed] == ["T3"]
 
 
 class TestSelectStage2Survivors:

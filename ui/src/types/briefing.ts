@@ -1,6 +1,6 @@
 /**
  * Mirrors core/briefing.py's dataclasses + the fields OrderProposal /
- * KillSwitchStatus / DriftStatus contribute to a serialized Briefing (see
+ * KillSwitchStatus contribute to a serialized Briefing (see
  * core/briefing_persistence.py — dataclasses.asdict, no reconstruction, so
  * the wire shape is exactly these dataclasses' field names). Keep this file
  * in lockstep with those five backend modules; nothing here is inferred.
@@ -51,6 +51,9 @@ export interface BookEntry {
   next_profit_band_pct: number | null;
   has_exit_trigger: boolean;
   no_research_coverage: boolean;
+  // Set when conviction_now is a real score reused from an earlier run.
+  conviction_run_id?: number | null;
+  conviction_age_days?: number | null;
 }
 
 export interface UnresearchedHolding {
@@ -82,13 +85,6 @@ export interface BlockedStatus {
   unpriced_positions: UnpricedPosition[];
 }
 
-export interface DriftStatus {
-  stale: boolean;
-  last_import_at: string | null; // ISO 8601
-  days_since_import: number | null;
-  threshold_days: number;
-}
-
 export interface Briefing {
   generated_at: string; // ISO 8601
   actions_today: ActionItem[];
@@ -96,7 +92,6 @@ export interface Briefing {
   overnight_changes: OvernightChange[];
   book: BookEntry[];
   portfolio_health: PortfolioHealth;
-  drift_warning: DriftStatus | null;
   blocked: BlockedStatus | null;
   unresearched_holdings: UnresearchedHolding[];
 }

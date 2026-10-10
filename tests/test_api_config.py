@@ -9,7 +9,6 @@ SAMPLE_YAML = """\
 version: 1
 
 portfolio:
-  import_reminder_days: 7
   allow_fractional: true
 
 risk:
@@ -54,7 +53,7 @@ def make_client(tmp_path):
 
 def valid_body(**overrides):
     body = {
-        "portfolio": {"import_reminder_days": 7, "allow_fractional": True},
+        "portfolio": {"allow_fractional": True},
         "risk": {
             "max_position_pct": 12, "max_sector_pct": 40, "max_correlated_cluster_pct": 50,
             "max_daily_proposals": 5, "max_daily_loss_pct": 3, "max_drawdown_pct": 12,

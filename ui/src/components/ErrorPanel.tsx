@@ -1,18 +1,16 @@
 import { WarningCircle, ArrowClockwise } from "@phosphor-icons/react";
+import { Button } from "./ui/Button";
 
 export function ErrorPanel({ message, onRetry }: { message: string; onRetry: () => void }) {
   return (
-    <div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 py-24 text-center">
-      <WarningCircle size={28} className="text-[var(--color-loss)]" />
-      <p className="text-sm font-medium text-[var(--color-ink)]">Couldn't load the briefing</p>
-      <p className="max-w-sm text-sm text-[var(--color-ink-dim)]">{message}</p>
-      <button
-        onClick={onRetry}
-        className="mt-1 flex items-center gap-1.5 rounded-md border border-[var(--color-hairline-strong)] px-3 py-1.5 text-xs font-medium text-[var(--color-ink)] transition-colors hover:bg-[var(--color-panel-raised)] active:scale-[0.98]"
-      >
-        <ArrowClockwise size={13} />
+    <div className="flex flex-col items-center justify-center gap-sp-3 rounded-card border border-line bg-inset px-sp-6 py-sp-8 text-center">
+      <WarningCircle size={28} className="text-loss" />
+      <p className="t-title text-ink">Couldn't load this screen</p>
+      <p className="max-w-[52ch] t-body text-ink-dim">{message}</p>
+      <Button onClick={onRetry} className="mt-sp-2">
+        <ArrowClockwise size={14} />
         Retry
-      </button>
+      </Button>
     </div>
   );
 }

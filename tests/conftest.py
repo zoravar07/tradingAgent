@@ -23,4 +23,4 @@ def session():
 
 @pytest.fixture
 def portfolio(session):
-    return PortfolioService(session, config=PortfolioConfig(import_reminder_days=7, allow_fractional=False))
+    return PortfolioService(session, config=PortfolioConfig(allow_fractional=False))

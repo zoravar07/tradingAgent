@@ -1,20 +1,28 @@
 import type { ReactNode } from "react";
 
-function FieldWrapper({ label, error, children }: { label: string; error?: string; children: ReactNode }) {
+function FieldWrapper({
+  label,
+  error,
+  children,
+}: {
+  label: string;
+  error?: string;
+  children: ReactNode;
+}) {
   return (
-    <label className="flex flex-col gap-1.5">
-      <span className="text-xs text-[var(--color-ink-dim)]">{label}</span>
+    <label className="flex flex-col gap-sp-2">
+      <span className="t-meta text-ink-dim">{label}</span>
       {children}
-      {error && <span className="text-xs text-[var(--color-loss)]">{error}</span>}
+      {error && <span className="t-meta text-loss">{error}</span>}
     </label>
   );
 }
 
 const inputClasses = (hasError: boolean) =>
   [
-    "num rounded-md border bg-[var(--color-panel-raised)] px-2.5 py-1.5 text-sm text-[var(--color-ink)]",
-    "outline-none transition-colors focus:border-[var(--color-accent)]",
-    hasError ? "border-[var(--color-loss)]" : "border-[var(--color-hairline-strong)]",
+    "num-table rounded-inner border bg-surface px-sp-3 py-sp-2 t-body text-ink",
+    "outline-none transition-colors duration-[var(--dur-hover)] focus:border-accent",
+    hasError ? "border-loss" : "border-line",
   ].join(" ");
 
 export function NumberField({
@@ -63,7 +71,7 @@ export function TextField({
         value={value}
         placeholder={placeholder}
         onChange={(e) => onChange(e.target.value)}
-        className={`${inputClasses(!!error)} font-mono`}
+        className={`${inputClasses(!!error)} placeholder:text-ink-faint`}
       />
     </FieldWrapper>
   );
@@ -79,14 +87,14 @@ export function CheckboxField({
   onChange: (v: boolean) => void;
 }) {
   return (
-    <label className="flex items-center gap-2.5 py-1.5">
+    <label className="flex items-center gap-sp-3 py-sp-2">
       <input
         type="checkbox"
         checked={checked}
         onChange={(e) => onChange(e.target.checked)}
         className="h-4 w-4 accent-[var(--color-accent)]"
       />
-      <span className="text-sm text-[var(--color-ink)]">{label}</span>
+      <span className="t-body text-ink">{label}</span>
     </label>
   );
 }

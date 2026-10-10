@@ -1,56 +1,264 @@
-@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400;14..32,500;14..32,600;14..32,700&display=swap");
 @import "tailwindcss";
 
 /*
- * Z Money is a single-user local dashboard, not a marketing surface — it
- * commits to one dark theme by design (spec §7: "dark, dense, data-first"),
- * not a light/dark toggle. Tokens live here as CSS variables so components
- * never hardcode a hex value.
+ * Z Money design tokens. The single source of truth is ui/DESIGN.md — this
+ * file is its implementation. Components never hardcode a hex, a duration,
+ * or a pixel spacing value; if a screen needs something that isn't here,
+ * the scale is wrong and belongs in DESIGN.md first.
  *
- * Palette: dark gray-blue ground (not pure black), one locked UI accent
- * (signal blue) for interactive/active state, and separate, non-negotiable
- * financial semantics (gain green / loss red / risk amber) — those aren't
- * "the brand accent", they're domain convention and must stay legible on
- * their own.
+ * Light-only by design. The previous build was dark; the reference this one
+ * is built to is a white, card-based, generously spaced layout, and a
+ * half-converted palette is worse than either. There is no theme toggle.
  */
 @theme {
-  --font-sans: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
-  --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", monospace;
+  --font-sans:
+    "Inter", ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 
-  --color-ground: #0c1016;
-  --color-panel: #12171f;
-  --color-panel-raised: #1a212c;
-  --color-hairline: #232b38;
-  --color-hairline-strong: #303a4a;
+  /* --- Surfaces. Depth comes from hairlines and one soft shadow, not from
+     a stack of grays: on white, a four-step ladder collapses visually. --- */
+  --color-canvas: #ffffff; /* main content ground */
+  --color-rail: #f7f7f8; /* sidebar */
+  --color-surface: #ffffff; /* cards */
+  --color-inset: #fafafa; /* card footers, muted rows, table headers */
+  --color-inset-strong: #f2f2f4; /* hover on an inset, meter tracks */
 
-  --color-ink: #e6e9ef;
-  --color-ink-dim: #98a1b3;
-  --color-ink-faint: #626d82;
+  /* --- Hairlines: 1px only. --- */
+  --color-line: #e9e9ec;
+  --color-line-strong: #d7d7dd;
 
-  --color-accent: #5b8fe8;
-  --color-accent-dim: #35507e;
-  --color-accent-wash: #182437;
+  /* --- Ink: three levels, no more. --- */
+  --color-ink: #111114;
+  --color-ink-dim: #5b5b66;
+  --color-ink-faint: #8e8e99;
 
-  --color-gain: #3fb67f;
-  --color-gain-wash: #13241d;
-  --color-loss: #e5594f;
-  --color-loss-wash: #2a1a1c;
-  --color-risk: #d9a441;
-  --color-risk-wash: #2a2116;
+  /* --- Accent: one hue, interactive meaning only. --- */
+  --color-accent: #4f5bd5;
+  --color-accent-wash: #eef1fe;
+  --color-accent-line: #dde3fc;
+
+  /* --- Semantics: reserved. Never decorative, never a "series color". --- */
+  --color-gain: #16a34a;
+  --color-gain-wash: #e8f6ee;
+  --color-loss: #e5484d;
+  --color-loss-wash: #fdecec;
+  --color-risk: #c2710c;
+  --color-risk-wash: #fdf2e3;
+
+  /* --- Conviction: its own magnitude ramp, keyed to the band the score
+     falls in. Not a status and not the accent — but the reference reads the
+     score out loud ("High conviction"), so the color has to agree with the
+     words. --- */
+  --color-conviction-track: #ebebee;
+
+  /* --- Spacing: one 4px scale. No ad-hoc pixel values. --- */
+  --spacing-sp-1: 4px;
+  --spacing-sp-2: 8px;
+  --spacing-sp-3: 12px;
+  --spacing-sp-4: 16px;
+  --spacing-sp-5: 24px;
+  --spacing-sp-6: 32px;
+  --spacing-sp-7: 40px;
+  --spacing-sp-8: 56px;
+
+  /* --- Radii: concentric. Inner elements step down from their container. --- */
+  --radius-chip: 6px;
+  --radius-inner: 8px;
+  --radius-card: 12px;
+
+  /* --- Elevation. One shadow, barely there: on white a card is defined by
+     its hairline, and the shadow only stops it floating. --- */
+  --shadow-card: 0 1px 2px rgba(17, 17, 20, 0.04);
+
+  /* --- Motion: three curves. No others, no hand-rolled approximations. --- */
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+:root {
+  --dur-press: 120ms;
+  --dur-hover: 160ms;
+  --dur-expand: 220ms;
+  --dur-meter: 280ms;
+  --dur-sheet: 300ms;
 }
 
 html {
-  color-scheme: dark;
+  color-scheme: light;
 }
 
 body {
-  background: var(--color-ground);
+  background: var(--color-canvas);
   color: var(--color-ink);
   font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
-/* Numeric/tabular data reads as mono throughout — see design read. */
-.num {
-  font-family: var(--font-mono);
+/* ---------------------------------------------------------------------
+   Type scale — eight steps, per DESIGN.md §2. Anything outside this list
+   is a mistake. Sized off the reference screenshot, which runs noticeably
+   larger than the previous dark build: the greeting is 34px, a stat value
+   22px, the conviction figure 40px.
+   --------------------------------------------------------------------- */
+.t-hero {
+  font-size: 34px;
+  line-height: 1.15;
+  letter-spacing: -0.025em;
+  font-weight: 700;
+}
+
+.t-figure {
+  font-size: 40px;
+  line-height: 1;
+  letter-spacing: -0.03em;
+  font-weight: 700;
+}
+
+.t-display {
+  font-size: 29px;
+  line-height: 1.1;
+  letter-spacing: -0.025em;
+  font-weight: 700;
+}
+
+.t-stat {
+  font-size: 22px;
+  line-height: 1.2;
+  letter-spacing: -0.02em;
+  font-weight: 700;
+}
+
+.t-lead {
+  font-size: 17px;
+  line-height: 1.5;
+  font-weight: 400;
+}
+
+.t-title {
+  font-size: 16px;
+  line-height: 1.4;
+  letter-spacing: -0.01em;
+  font-weight: 600;
+}
+
+.t-body {
+  font-size: 15px;
+  line-height: 1.6;
+  font-weight: 400;
+}
+
+.t-meta {
+  font-size: 13px;
+  line-height: 1.45;
+  font-weight: 400;
+}
+
+/* The one uppercase step: status pills only. Labels in the reference are
+   sentence/title case at --t-meta, not uppercase eyebrows. */
+.t-pill {
+  font-size: 12.5px;
+  line-height: 1.2;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  font-weight: 600;
+}
+
+/* tabular-nums ONLY in columns, where digits must align vertically.
+   dataviz: a large standalone value with tabular figures looks loose,
+   because every digit gets the width of a `0`. That is why .t-figure and
+   .t-stat deliberately do not carry this. */
+.num-table {
   font-variant-numeric: tabular-nums;
+}
+
+/* ---------------------------------------------------------------------
+   Motion utilities. Everything here is opt-in — components apply motion
+   deliberately rather than inheriting it.
+   --------------------------------------------------------------------- */
+
+/* Card list entrance: 8px rise + fade, 220ms, 40ms stagger (set by the
+   caller via --stagger-index). Within `animate`'s 30-80ms stagger budget. */
+@keyframes rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-rise {
+  animation: rise-in var(--dur-expand) var(--ease-out) both;
+  animation-delay: calc(var(--stagger-index, 0) * 40ms);
+}
+
+/* Press feedback for any pressable element. */
+.pressable {
+  transition:
+    transform var(--dur-press) var(--ease-out),
+    background-color var(--dur-hover) ease,
+    border-color var(--dur-hover) ease,
+    color var(--dur-hover) ease;
+}
+
+.pressable:active {
+  transform: scale(0.98);
+}
+
+/* Expandable region: grid-rows 0fr -> 1fr is the only way to transition to
+   an unknown content height without animating `height` itself. */
+.expandable {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition:
+    grid-template-rows var(--dur-expand) var(--ease-out),
+    opacity var(--dur-expand) var(--ease-out);
+  opacity: 0;
+}
+
+.expandable[data-open="true"] {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+
+.expandable > * {
+  overflow: hidden;
+}
+
+/* Focus: one visible ring everywhere, accent-colored. Accessibility
+   requirement, not decoration. */
+:where(a, button, summary, input, textarea, select, [tabindex]):focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-chip);
+}
+
+/* Touch devices fire hover on tap — gate hover motion behind a real
+   pointer, per `animate` §7. */
+@media (hover: hover) and (pointer: fine) {
+  .hover-raise:hover {
+    border-color: var(--color-line-strong);
+    background-color: var(--color-inset);
+  }
+}
+
+/* Reduced motion means FEWER AND GENTLER, not zero. Movement and transforms
+   go; opacity and color transitions stay, because they aid comprehension.
+   Blanket-killing every transition is itself a defect — see `animate` §7. */
+@media (prefers-reduced-motion: reduce) {
+  .animate-rise {
+    animation: none;
+  }
+
+  .pressable:active {
+    transform: none;
+  }
+
+  .expandable {
+    transition: opacity var(--dur-expand) ease;
+  }
 }

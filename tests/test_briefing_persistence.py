@@ -4,7 +4,6 @@ import json
 from agents.order_builder import OrderProposal
 from core.briefing import ActionItem, BookEntry, PortfolioHealth, UnpricedPosition, UnresearchedHolding, assemble_blocked_briefing, assemble_briefing
 from core.briefing_persistence import deserialize_briefing, serialize_briefing
-from core.portfolio import DriftStatus
 from core.risk_rules import KillSwitchStatus
 
 NOW = dt.datetime(2026, 8, 25, 22, 0, 0)
@@ -26,7 +25,6 @@ class TestSerializeRoundTrip:
             overnight_changes=[],
             book=[BookEntry(ticker="AMD", qty=3.5, value_usd=1681.0, weight_pct=13.7, unrealized_pnl_pct=132.5, conviction_now=54.0, has_exit_trigger=True)],
             portfolio_health=PortfolioHealth(cash_pct=0.3, drawdown_from_peak_pct=0.0, kill_switch=KillSwitchStatus(triggered=False)),
-            drift=DriftStatus(stale=True, last_import_at=None, days_since_import=None, threshold_days=7),
             unresearched_holdings=[UnresearchedHolding(ticker="VGT", reason="Stage 1 data fetch failed: no fundamentals")],
         )
 
@@ -39,7 +37,6 @@ class TestSerializeRoundTrip:
         assert result["book"][0]["ticker"] == "AMD"
         assert result["book"][0]["value_usd"] == 1681.0
         assert result["portfolio_health"]["kill_switch"]["triggered"] is False
-        assert result["drift_warning"]["stale"] is True
         assert result["unresearched_holdings"][0]["ticker"] == "VGT"
         assert result["blocked"] is None
 
@@ -57,7 +54,7 @@ class TestSerializeRoundTrip:
     def test_output_is_valid_json(self):
         briefing = assemble_briefing(
             generated_at=NOW, actions_today=[], watching=[], overnight_changes=[], book=[],
-            portfolio_health=PortfolioHealth(), drift=None,
+            portfolio_health=PortfolioHealth(),
         )
         raw = serialize_briefing(briefing)
         json.loads(raw)  # must not raise
@@ -65,7 +62,7 @@ class TestSerializeRoundTrip:
     def test_empty_briefing_round_trips(self):
         briefing = assemble_briefing(
             generated_at=NOW, actions_today=[], watching=[], overnight_changes=[], book=[],
-            portfolio_health=PortfolioHealth(), drift=None,
+            portfolio_health=PortfolioHealth(),
         )
         result = deserialize_briefing(serialize_briefing(briefing))
         assert result["actions_today"] == []

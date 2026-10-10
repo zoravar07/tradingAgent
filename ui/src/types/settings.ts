@@ -1,7 +1,6 @@
 /** Mirrors api/routes/config.py's request/response shapes. */
 
 export interface PortfolioFields {
-  import_reminder_days: number;
   allow_fractional: boolean;
 }
 

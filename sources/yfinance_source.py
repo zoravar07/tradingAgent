@@ -50,6 +50,23 @@ TTL_FUNDAMENTALS = 30 * 24 * 3600  # matches sources/fmp.py's TTL_FUNDAMENTALS
 PriceFetcher = Callable[[str], float]
 HistoryFetcher = Callable[[str, str], list[dict]]
 RawStatementFetcher = Callable[[str], list[dict]]
+QuoteFetcher = Callable[[str], dict]
+BatchHistoryFetcher = Callable[[list[str], str], dict[str, list[dict]]]
+BATCH_CHUNK = 100  # tickers per yf.download call — keeps one Yahoo request bounded
+
+
+@dataclass(frozen=True)
+class QuoteSnapshot:
+    """The Stage 1 liquidity inputs, from yfinance's `fast_info` — so a
+    full-index Stage 1 scan costs zero FMP calls (FMP's `profile` used to
+    supply market cap and average volume, one budgeted call per name).
+    `market_cap` is None for ETFs (yfinance reports none); `avg_daily_volume_usd`
+    is 3-month average share volume x last price, None if either is missing."""
+
+    market_cap: float | None
+    avg_daily_volume_usd: float | None
+    last_price: float | None
+    quote_type: str | None
 
 # yfinance row name -> FMP JSON key. Only fields verified to match FMP
 # EXACTLY, for both AMD and MSFT, across BOTH periods checked (the most
@@ -124,6 +141,19 @@ def _default_price_fetcher(ticker: str) -> float:
     return float(price)
 
 
+def _default_quote_fetcher(ticker: str) -> dict:
+    import yfinance as yf
+
+    fast_info = yf.Ticker(ticker).fast_info
+    get = fast_info.get if hasattr(fast_info, "get") else (lambda key, default=None: default)
+    return {
+        "market_cap": get("marketCap"),
+        "three_month_avg_volume": get("threeMonthAverageVolume"),
+        "last_price": get("lastPrice"),
+        "quote_type": get("quoteType"),
+    }
+
+
 def _default_history_fetcher(ticker: str, period: str) -> list[dict]:
     import yfinance as yf
 
@@ -143,6 +173,49 @@ def _default_history_fetcher(ticker: str, period: str) -> list[dict]:
             }
         )
     return rows  # yfinance's history() is already chronological ascending
+
+
+def _default_batch_history_fetcher(tickers: list[str], period: str) -> dict[str, list[dict]]:
+    """One yf.download per chunk of tickers instead of one Ticker.history
+    per name — the difference between a ~500-name Stage 1 taking a few
+    minutes and taking most of an hour. Tickers Yahoo returns nothing for
+    are simply absent from the result; the per-ticker path handles them."""
+    import math
+
+    import yfinance as yf
+
+    out: dict[str, list[dict]] = {}
+    for start in range(0, len(tickers), BATCH_CHUNK):
+        chunk = tickers[start : start + BATCH_CHUNK]
+        df = yf.download(chunk, period=period, interval="1d", group_by="ticker", threads=True, progress=False, auto_adjust=True)
+        if df is None or df.empty:
+            continue
+        for ticker in chunk:
+            try:
+                sub = df[ticker] if len(chunk) > 1 else df
+            except KeyError:
+                continue
+            sub = sub.dropna(subset=["Close"])
+            if sub.empty:
+                continue
+            rows = []
+            for date, row in sub.iterrows():
+                close = float(row["Close"])
+                if math.isnan(close):
+                    continue
+                rows.append(
+                    {
+                        "date": date.strftime("%Y-%m-%d"),
+                        "open": float(row["Open"]),
+                        "high": float(row["High"]),
+                        "low": float(row["Low"]),
+                        "close": close,
+                        "volume": float(row["Volume"]),
+                    }
+                )
+            if rows:
+                out[ticker] = rows
+    return out
 
 
 def _dataframe_to_raw_rows(df) -> list[dict]:
@@ -182,6 +255,51 @@ class YFinanceClient:
     history_fetcher: HistoryFetcher = _default_history_fetcher
     income_statement_raw_fetcher: RawStatementFetcher = _default_income_statement_raw_fetcher
     cash_flow_raw_fetcher: RawStatementFetcher = _default_cash_flow_raw_fetcher
+    quote_fetcher: QuoteFetcher = _default_quote_fetcher
+    batch_history_fetcher: BatchHistoryFetcher = _default_batch_history_fetcher
+
+    def prefetch_history(self, tickers: list[str], period: str = "2y") -> int:
+        """Warm the history cache for many tickers in a few batched calls.
+        Returns how many were cached. Never raises: a failed batch just
+        means get_historical_bars falls back to per-ticker fetches."""
+        missing = [t for t in dict.fromkeys(tickers) if self.cache.get(f"yf:hist:{t}:{period}") is None]
+        if not missing:
+            return 0
+        try:
+            fetched = self.batch_history_fetcher(missing, period)
+        except Exception:  # noqa: BLE001 — degrade to the per-ticker path
+            return 0
+        count = 0
+        for ticker, rows in fetched.items():
+            if rows:
+                self.cache.set(f"yf:hist:{ticker}:{period}", rows, TTL_HISTORICAL)
+                count += 1
+        return count
+
+    def prefetch_quotes(self, quotes: dict[str, dict]) -> int:
+        """Seed the quote cache from an external batch source (the US equity
+        screener — sources/us_listing.py) so get_quote_snapshot never calls
+        fast_info for those names. Returns how many were written."""
+        count = 0
+        for ticker, raw in quotes.items():
+            key = f"yf:quote:{ticker.upper()}"
+            if self.cache.get(key) is None:
+                self.cache.set(key, raw, TTL_QUOTE)
+                count += 1
+        return count
+
+    def get_quote_snapshot(self, ticker: str) -> QuoteSnapshot:
+        def fetch() -> dict:
+            return self.quote_fetcher(ticker)
+
+        raw, _ = self.cache.get_or_fetch(f"yf:quote:{ticker}", TTL_QUOTE, fetch)
+        market_cap = _clean(raw.get("market_cap"))
+        volume = _clean(raw.get("three_month_avg_volume"))
+        price = _clean(raw.get("last_price"))
+        adv_usd = (volume * price) if (volume is not None and price is not None) else None
+        return QuoteSnapshot(
+            market_cap=market_cap, avg_daily_volume_usd=adv_usd, last_price=price, quote_type=raw.get("quote_type")
+        )
 
     def get_current_price(self, ticker: str) -> float:
         def fetch() -> float:

@@ -22,10 +22,10 @@ so a decaying/illiquid held name is visible, not silently laundered through.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from core.config import Stage1Config, Stage2Config
 from core.llm import LLMClient, UsageRecord
@@ -168,16 +168,38 @@ def select_survivors(results: list[Stage1Result], config: Stage1Config) -> list[
 # ---------------------------------------------------------------- Stage 2
 
 STAGE2_SYSTEM_PROMPT = (
-    "You are a fast pre-screen triage analyst. Given a ticker and a lookback "
-    "window, state in one line whether there has been any material development "
-    "recently — new contracts, guidance changes, regulatory news, a management "
-    "change, or a sector shock affecting this name. Set material=true only for "
-    "something that could meaningfully change the investment case, not routine "
-    "news or ordinary price movement. Be concise and specific in the verdict."
+    "You are a quantitative pre-screen for an equity research desk. You receive one line of "
+    "Stage 1 data per candidate — liquidity, momentum versus the index and moving averages, "
+    "volatility regime, valuation band, revenue growth and free cash flow — and you rank the "
+    "candidates by how much each merits a full research memo tonight. Use only the numbers "
+    "given: no outside knowledge, no news, no recollection of the company. Score every "
+    "candidate 0-100 and give a one-sentence reason that cites the figures that drove it, written in "
+    "plain English a beginner can follow — say 'has gone up 20% more than the S&P 500 over three months' "
+    "rather than 'RS +20%', and explain any term you must use. Return every ticker you were given, exactly once."
 )
+
+# Stage 2's job is prioritisation, not fact-finding (it decides which names
+# spend a Sonnet memo), so it runs on cached Stage 1 numbers in one batched
+# Haiku call per chunk — no web search. A grounded, per-name triage was
+# tried (runs 6-7) and cost ~$2.60/run, ten times the memos it was
+# steering; the news it found reaches the pipeline through the research
+# digest instead, only for names that actually get a memo.
+STAGE2_BATCH_SIZE = 40
+
+
+class Stage2Score(BaseModel):
+    ticker: str
+    score: float = Field(ge=0, le=100)
+    reason: str
+
+
+class Stage2Ranking(BaseModel):
+    items: list[Stage2Score]
 
 
 class Stage2Verdict(BaseModel):
+    """Kept for callers/tests that build a verdict directly."""
+
     verdict: str
     material: bool
 
@@ -186,9 +208,10 @@ class Stage2Verdict(BaseModel):
 class Stage2Result:
     ticker: str
     verdict: str
-    material: bool
+    material: bool  # shortlisted for a memo (non-held); held names are always researched on their own cadence
     passed: bool
     is_held: bool
+    score: float | None = None
     usage: UsageRecord | None = None
     error: str | None = None
 
@@ -197,65 +220,92 @@ class Stage2Result:
         return self.error is None
 
 
-def run_stage2_triage(llm: LLMClient, stage1_result: Stage1Result, config: Stage2Config) -> Stage2Result:
-    """One Haiku call per Stage 1 survivor (§5.1). A failed call (budget
-    exhausted, malformed output after retries, API error) doesn't crash the
-    run — it surfaces as `error` and, for a held position, still `passed`
-    (§5's held-always-enters-pipeline rule doesn't get weaker just because
-    triage failed); a non-held name with a failed triage is dropped, same as
-    one triage correctly found not material."""
-    user_message = (
-        f"Ticker: {stage1_result.ticker}\nLookback: last {config.lookback_days} days\n"
-        "Has anything material happened to this name recently?"
-    )
-    try:
-        result = llm.call_structured(
-            model=config.model,
-            system=STAGE2_SYSTEM_PROMPT,
-            user_message=user_message,
-            output_model=Stage2Verdict,
-            max_tokens=256,
-        )
-    except Exception as exc:  # noqa: BLE001 — one bad triage must not kill the run
-        return Stage2Result(
-            ticker=stage1_result.ticker,
-            verdict="",
-            material=False,
-            passed=stage1_result.is_held,
-            is_held=stage1_result.is_held,
-            error=str(exc),
-        )
+def _fmt(value: float | None, spec: str = ".1f", scale: float = 1.0, suffix: str = "") -> str:
+    return "n/a" if value is None else f"{value / scale:{spec}}{suffix}"
 
-    verdict = result.parsed
-    return Stage2Result(
-        ticker=stage1_result.ticker,
-        verdict=verdict.verdict,
-        material=verdict.material,
-        passed=stage1_result.is_held or verdict.material,
-        is_held=stage1_result.is_held,
-        usage=result.usage,
+
+def describe_candidate(item: ScreenerInput, result: Stage1Result) -> str:
+    """One data line per candidate — the only thing Stage 2 sees."""
+    t = item.technical
+    return (
+        f"{item.ticker}: mcap ${_fmt(item.market_cap_usd, '.1f', 1e9)}B, ADV ${_fmt(item.avg_daily_volume_usd, '.0f', 1e6)}M, "
+        f"RS vs SPY 63d {_fmt(t.relative_strength_vs_spy_pct, '+.1f', 1, '%')}, "
+        f"px vs 50DMA {_fmt(t.price_vs_sma_50_pct, '+.1f', 1, '%')}, px vs 200DMA {_fmt(t.price_vs_sma_200_pct, '+.1f', 1, '%')}, "
+        f"ATR {_fmt(t.atr_pct_of_price, '.1f', 1, '% of price')} (pctile {_fmt(t.atr_percentile_252d, '.0f')}), "
+        f"valuation {result.gates.valuation_band}, P/E {_fmt(item.trailing_pe, '.0f')}, "
+        f"rev growth {_fmt(item.revenue_growth_pct, '+.0f', 1, '%')}, FCF {'positive' if (item.free_cash_flow or 0) > 0 else 'not positive'}"
+        f"{', earnings within window' if result.gates.earnings_soon else ''}"
     )
 
 
-def run_stage2_batch(llm: LLMClient, stage1_results: list[Stage1Result], config: Stage2Config) -> list[Stage2Result]:
-    return [run_stage2_triage(llm, r, config) for r in stage1_results]
+def run_stage2_batch(
+    llm: LLMClient,
+    stage1_results: list[Stage1Result],
+    config: Stage2Config,
+    screener_inputs: dict[str, ScreenerInput] | None = None,
+) -> list[Stage2Result]:
+    """Held names never go to the model — they are researched on their own
+    cadence regardless (§5). Non-held survivors are ranked in chunks of
+    STAGE2_BATCH_SIZE, one structured call each; the top `max_survivors`
+    by score are shortlisted. A failed chunk drops its names (surfaced as
+    `error`), never the run."""
+    screener_inputs = screener_inputs or {}
+    held = [r for r in stage1_results if r.is_held]
+    non_held = [r for r in stage1_results if not r.is_held]
+
+    results: list[Stage2Result] = [
+        Stage2Result(ticker=r.ticker, verdict="held — researched on the holdings cadence", material=False, passed=True, is_held=True)
+        for r in held
+    ]
+
+    scored: dict[str, tuple[float, str, UsageRecord | None]] = {}
+    failed: dict[str, str] = {}
+    for start in range(0, len(non_held), config.batch_size):
+        chunk = non_held[start : start + config.batch_size]
+        lines = []
+        for r in chunk:
+            item = screener_inputs.get(r.ticker)
+            lines.append(describe_candidate(item, r) if item else f"{r.ticker}: (no Stage 1 data available)")
+        user_message = "Candidates:\n" + "\n".join(lines) + "\n\nRank them."
+        try:
+            call = llm.call_structured(
+                model=config.model, system=STAGE2_SYSTEM_PROMPT, user_message=user_message,
+                output_model=Stage2Ranking, max_tokens=max(600, 60 * len(chunk)),
+            )
+        except Exception as exc:  # noqa: BLE001 — one bad chunk must not kill the run
+            for r in chunk:
+                failed[r.ticker] = str(exc)
+            continue
+        by_ticker = {s.ticker.upper(): s for s in call.parsed.items}
+        for r in chunk:
+            s = by_ticker.get(r.ticker.upper())
+            if s is None:
+                failed[r.ticker] = "ticker missing from the ranking reply"
+            else:
+                scored[r.ticker] = (s.score, s.reason, call.usage)
+
+    shortlist = {t for t, _ in sorted(scored.items(), key=lambda kv: -kv[1][0])[: config.max_survivors]}
+    for r in non_held:
+        if r.ticker in scored:
+            score, reason, usage = scored[r.ticker]
+            chosen = r.ticker in shortlist
+            results.append(Stage2Result(ticker=r.ticker, verdict=reason, material=chosen, passed=chosen, is_held=False, score=score, usage=usage))
+        else:
+            results.append(Stage2Result(ticker=r.ticker, verdict="", material=False, passed=False, is_held=False, error=failed.get(r.ticker)))
+    return results
 
 
 def select_stage2_survivors(
     results: list[Stage2Result], stage1_by_ticker: dict[str, Stage1Result], config: Stage2Config
 ) -> list[Stage2Result]:
-    """§5's pipeline diagram shows Stage 2 trimming ~40 -> ~15
-    (`config.max_survivors`); the spec doesn't state the trim rule beyond
-    the material/not-material flag itself, so: held positions always pass
-    through (as in Stage 1); among the rest, only names flagged `material`
-    are candidates for a full research memo (a Haiku call finding nothing
-    material is itself a reason to not spend a Sonnet call); if more than
-    `max_survivors` are material, keep the ones Stage 1 ranked highest."""
+    """Held names always pass through (as in Stage 1); the shortlisted
+    non-held names follow, best score first (Stage 1's rank breaks ties or
+    stands in when a score is missing), trimmed to `max_survivors`."""
     held = [r for r in results if r.is_held]
     non_held_passed = [r for r in results if not r.is_held and r.passed]
     ranked = sorted(
         non_held_passed,
-        key=lambda r: stage1_by_ticker[r.ticker].rank_score or float("-inf"),
+        key=lambda r: (r.score if r.score is not None else -1.0, stage1_by_ticker[r.ticker].rank_score or float("-inf")),
         reverse=True,
     )
     return held + ranked[: config.max_survivors]

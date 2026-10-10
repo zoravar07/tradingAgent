@@ -162,3 +162,127 @@ class TestGetCashFlowStatement:
         client, calls = make_client(tmp_path, cash_flow_fetcher=failing)
         with pytest.raises(YFinanceError):
             client.get_cash_flow_statement("BADTICKER")
+
+
+class TestQuoteSnapshot:
+    def test_uses_injected_fetcher_and_caches(self, tmp_path):
+        from core.cache import FileCache
+        from sources.yfinance_source import YFinanceClient
+
+        calls = []
+
+        def quote_fetcher(ticker):
+            calls.append(ticker)
+            return {"market_cap": 5e9, "three_month_avg_volume": 2_000_000.0, "last_price": 100.0, "quote_type": "EQUITY"}
+
+        client = YFinanceClient(cache=FileCache(tmp_path / "cache"), quote_fetcher=quote_fetcher)
+        snap = client.get_quote_snapshot("AMD")
+        again = client.get_quote_snapshot("AMD")
+        assert snap.market_cap == 5e9
+        assert snap.avg_daily_volume_usd == 2_000_000.0 * 100.0
+        assert again == snap
+        assert calls == ["AMD"]  # second call served from cache
+
+    def test_etf_has_no_market_cap_but_still_has_volume(self, tmp_path):
+        from core.cache import FileCache
+        from sources.yfinance_source import YFinanceClient
+
+        client = YFinanceClient(
+            cache=FileCache(tmp_path / "cache"),
+            quote_fetcher=lambda t: {"market_cap": None, "three_month_avg_volume": 3e6, "last_price": 377.6, "quote_type": "ETF"},
+        )
+        snap = client.get_quote_snapshot("VTI")
+        assert snap.market_cap is None
+        assert snap.avg_daily_volume_usd == 3e6 * 377.6
+
+    def test_missing_volume_gives_none_adv_not_zero(self, tmp_path):
+        from core.cache import FileCache
+        from sources.yfinance_source import YFinanceClient
+
+        client = YFinanceClient(
+            cache=FileCache(tmp_path / "cache"),
+            quote_fetcher=lambda t: {"market_cap": 1e9, "three_month_avg_volume": None, "last_price": 10.0, "quote_type": "EQUITY"},
+        )
+        assert client.get_quote_snapshot("X").avg_daily_volume_usd is None
+
+
+class TestPrefetchHistory:
+    def _rows(self):
+        return [{"date": "2026-08-25", "open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 10.0}]
+
+    def test_batch_fetch_populates_cache_so_per_ticker_fetch_is_never_called(self, tmp_path):
+        from core.cache import FileCache
+        from sources.yfinance_source import YFinanceClient
+
+        per_ticker_calls = []
+        batch_calls = []
+
+        def history_fetcher(ticker, period):
+            per_ticker_calls.append(ticker)
+            raise AssertionError("per-ticker history should not be called after prefetch")
+
+        def batch_fetcher(tickers, period):
+            batch_calls.append((list(tickers), period))
+            return {t: self._rows() for t in tickers}
+
+        client = YFinanceClient(cache=FileCache(tmp_path / "cache"), history_fetcher=history_fetcher, batch_history_fetcher=batch_fetcher)
+        cached = client.prefetch_history(["AMD", "NVDA", "SPY"])
+        assert cached == 3
+        assert batch_calls == [(["AMD", "NVDA", "SPY"], "2y")]
+        assert client.get_historical_bars("AMD")[0].close == 1.5
+        assert client.get_historical_bars("SPY")[0].close == 1.5
+        assert per_ticker_calls == []
+
+    def test_already_cached_tickers_are_skipped(self, tmp_path):
+        from core.cache import FileCache
+        from sources.yfinance_source import YFinanceClient
+
+        batch_calls = []
+        client = YFinanceClient(
+            cache=FileCache(tmp_path / "cache"),
+            history_fetcher=lambda t, p: self._rows(),
+            batch_history_fetcher=lambda tickers, period: (batch_calls.append(list(tickers)) or {t: self._rows() for t in tickers}),
+        )
+        client.get_historical_bars("AMD")  # per-ticker path, now cached
+        client.prefetch_history(["AMD", "NVDA"])
+        assert batch_calls == [["NVDA"]]
+
+    def test_missing_tickers_in_batch_fall_through_to_per_ticker_fetch(self, tmp_path):
+        from core.cache import FileCache
+        from sources.yfinance_source import YFinanceClient, YFinanceError
+
+        client = YFinanceClient(
+            cache=FileCache(tmp_path / "cache"),
+            history_fetcher=lambda t, p: (_ for _ in ()).throw(YFinanceError(f"no history for {t}")),
+            batch_history_fetcher=lambda tickers, period: {"AMD": self._rows()},  # NVDA absent
+        )
+        assert client.prefetch_history(["AMD", "NVDA"]) == 1
+        with pytest.raises(YFinanceError):
+            client.get_historical_bars("NVDA")
+
+    def test_batch_fetcher_failure_is_swallowed_and_returns_zero(self, tmp_path):
+        from core.cache import FileCache
+        from sources.yfinance_source import YFinanceClient
+
+        def boom(tickers, period):
+            raise RuntimeError("yahoo down")
+
+        client = YFinanceClient(cache=FileCache(tmp_path / "cache"), history_fetcher=lambda t, p: self._rows(), batch_history_fetcher=boom)
+        assert client.prefetch_history(["AMD"]) == 0
+        assert client.get_historical_bars("AMD")[0].close == 1.5  # per-ticker path still works
+
+
+class TestPrefetchQuotes:
+    def test_seeded_quotes_skip_the_fetcher(self, tmp_path):
+        from core.cache import FileCache
+        from sources.yfinance_source import YFinanceClient
+
+        def boom(ticker):
+            raise AssertionError("fast_info should not be called for a seeded ticker")
+
+        client = YFinanceClient(cache=FileCache(tmp_path / "cache"), quote_fetcher=boom)
+        n = client.prefetch_quotes({"amd": {"market_cap": 1e10, "three_month_avg_volume": 1e6, "last_price": 100.0, "quote_type": "EQUITY"}})
+        assert n == 1
+        snap = client.get_quote_snapshot("AMD")
+        assert snap.market_cap == 1e10 and snap.avg_daily_volume_usd == 1e8
+        assert client.prefetch_quotes({"AMD": {"market_cap": 0}}) == 0  # already cached, not overwritten

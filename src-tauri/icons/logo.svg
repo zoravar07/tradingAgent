@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <!-- Z Money mark, on Apple's macOS icon grid: transparent canvas, the dark
+       tile inset 10% (410x410 centred, radius 92 ~ 22% of its width), and
+       the coin + Z scaled by 410/512 inside it with unchanged proportions. -->
+  <rect x="51" y="51" width="410" height="410" rx="92" ry="92" fill="#0B1220"/>
+  <g transform="translate(51 51) scale(0.80078125)">
+    <circle cx="256" cy="256" r="185" fill="#10B981"/>
+    <!-- ridged edge: dashed stroke over the coin's rim -->
+    <circle cx="256" cy="256" r="185" fill="none" stroke="#0B1220" stroke-width="24" stroke-dasharray="21 21"/>
+    <!-- inner ring -->
+    <circle cx="256" cy="256" r="144" fill="none" stroke="#0B1220" stroke-width="10"/>
+    <!-- geometric Z, 165 x 165 centred, filled polygon with squared corners -->
+    <polygon fill="#0B1220" points="173.5,173.5 338.5,173.5 338.5,207.5 225.5,304.5 338.5,304.5 338.5,338.5 173.5,338.5 173.5,304.5 286.5,207.5 173.5,207.5"/>
+  </g>
+</svg>

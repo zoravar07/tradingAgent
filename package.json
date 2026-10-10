@@ -1,0 +1,13 @@
+{
+  "name": "z-money-app",
+  "private": true,
+  "description": "Tauri shell for Z Money: starts the FastAPI backend and serves the built UI in a native window.",
+  "scripts": {
+    "tauri": "tauri",
+    "app:build": "tauri build",
+    "app:dev": "tauri dev"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0"
+  }
+}

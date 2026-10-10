@@ -1,6 +1,67 @@
+# --- Secrets & credentials ---
 .env
-data/
+.env.*
+*.env
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*credentials*.json
+*secret*.json
+client_secret*.json
+token.json
+*.token
+.netrc
+
+# --- Python ---
 .venv/
+venv/
+env/
 __pycache__/
-*.pyc
+*.py[cod]
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+.ipynb_checkpoints/
+
+# --- Node / UI ---
+node_modules/
+ui/dist/
+dist/
+dist-ssr/
+*.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- Tauri / Rust build output ---
+src-tauri/target/
+src-tauri/gen/
+target/
+
+# --- Local data, caches, databases ---
+data/
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# --- Logs ---
+logs/
+*.log
+
+# --- Build output ---
+build/
+
+# --- OS / editor ---
+.DS_Store
+.vscode/
+.idea/
+*.swp

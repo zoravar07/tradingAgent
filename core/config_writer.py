@@ -38,7 +38,6 @@ _yaml.indent(mapping=2, sequence=2, offset=0)
 # (dotted path in the yaml, path as a tuple of keys) — the single source of
 # truth for which fields the Settings screen can edit and where they live.
 EDITABLE_FIELDS: list[tuple[str, ...]] = [
-    ("portfolio", "import_reminder_days"),
     ("portfolio", "allow_fractional"),
     ("risk", "max_position_pct"),
     ("risk", "max_sector_pct"),
@@ -122,7 +121,6 @@ def default_values() -> dict[str, Any]:
     schedule = ScheduleConfig()
     return {
         "portfolio": {
-            "import_reminder_days": portfolio.import_reminder_days,
             "allow_fractional": portfolio.allow_fractional,
         },
         "risk": {

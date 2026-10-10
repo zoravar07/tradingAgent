@@ -1,21 +1,42 @@
-import { useCallback, useEffect, useState } from "react";
+import { useState } from "react";
 import { ArrowsCounterClockwise, Eye, FloppyDisk } from "@phosphor-icons/react";
-import { ApiError } from "../api/client";
 import { fetchConfig, fieldKeyFromLoc, resetConfigToDefaults, updateConfig } from "../api/config";
+import { useAsyncData } from "../lib/useAsyncData";
 import type { ConfigResponse, EditableConfig } from "../types/settings";
 import { ErrorPanel } from "../components/ErrorPanel";
 import { LoadingSkeleton } from "../components/LoadingSkeleton";
-import { StatusPill } from "../components/StatusPill";
-import { SectionShell } from "../components/briefing/SectionShell";
+import { Button } from "../components/ui/Button";
+import { Card } from "../components/ui/Card";
+import { ScreenShell, Section } from "../components/ui/ScreenShell";
+import { StatusPill } from "../components/ui/StatusPill";
 import { CheckboxField, NumberField, TextField } from "../components/settings/Field";
-
-type LoadState = { kind: "loading" } | { kind: "error"; message: string } | { kind: "loaded" };
 
 type SaveState = "idle" | "saving" | "saved" | "error";
 
+/** A titled panel of fields. Same card grammar as every other screen. */
+function SettingsGroup({
+  title,
+  subtitle,
+  children,
+}: {
+  title: string;
+  subtitle?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <Section title={title} subtitle={subtitle}>
+      <Card>
+        <div className="px-sp-6 py-sp-5">{children}</div>
+      </Card>
+    </Section>
+  );
+}
+
 export function SettingsScreen() {
-  const [loadState, setLoadState] = useState<LoadState>({ kind: "loading" });
-  const [config, setConfig] = useState<ConfigResponse | null>(null);
+  // Settings both reads and writes config, so it keeps its own copy of the
+  // form separate from the fetched value: the two diverge the moment you
+  // type, and reload() must be able to throw the edits away.
+  const { state, reload, setData } = useAsyncData(fetchConfig, "Unexpected error loading settings.");
   const [form, setForm] = useState<EditableConfig | null>(null);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [saveState, setSaveState] = useState<SaveState>("idle");
@@ -24,22 +45,15 @@ export function SettingsScreen() {
   const [rawText, setRawText] = useState<string | null>(null);
   const [rawLoading, setRawLoading] = useState(false);
 
-  const load = useCallback(async () => {
-    setLoadState({ kind: "loading" });
-    try {
-      const data = await fetchConfig();
-      setConfig(data);
-      setForm(data.editable);
-      setLoadState({ kind: "loaded" });
-    } catch (err) {
-      const message = err instanceof ApiError ? err.message : "Unexpected error loading settings.";
-      setLoadState({ kind: "error", message });
-    }
-  }, []);
-
-  useEffect(() => {
-    load();
-  }, [load]);
+  const config = state.kind === "loaded" ? state.data : null;
+  // Seed the form the first time config lands, and after a reload that
+  // cleared it. Derived during render rather than in an effect — an effect
+  // here would paint one frame of empty inputs first.
+  const [seededFor, setSeededFor] = useState<ConfigResponse | null>(null);
+  if (config && seededFor !== config) {
+    setSeededFor(config);
+    setForm(config.editable);
+  }
 
   async function handleSave() {
     if (!form) return;
@@ -47,7 +61,8 @@ export function SettingsScreen() {
     setSaveMessage(null);
     const result = await updateConfig(form);
     if (result.ok) {
-      setConfig(result.data);
+      setData(() => result.data);
+      setSeededFor(result.data);
       setForm(result.data.editable);
       setFieldErrors({});
       setSaveState("saved");
@@ -58,16 +73,22 @@ export function SettingsScreen() {
       for (const e of result.errors) errors[fieldKeyFromLoc(e.loc)] = e.msg;
       setFieldErrors(errors);
       setSaveState("error");
-      setSaveMessage(`${result.errors.length} field${result.errors.length === 1 ? "" : "s"} failed validation.`);
+      setSaveMessage(
+        `${result.errors.length} field${result.errors.length === 1 ? "" : "s"} failed validation.`,
+      );
     }
   }
 
   async function handleReset() {
-    if (!window.confirm("Reset every editable setting to its default value? This overwrites config.yaml.")) return;
+    if (
+      !window.confirm("Reset every editable setting to its default value? This overwrites config.yaml.")
+    )
+      return;
     setSaveState("saving");
     const result = await resetConfigToDefaults();
     if (result.ok) {
-      setConfig(result.data);
+      setData(() => result.data);
+      setSeededFor(result.data);
       setForm(result.data.editable);
       setFieldErrors({});
       setSaveState("saved");
@@ -75,7 +96,9 @@ export function SettingsScreen() {
       setTimeout(() => setSaveState("idle"), 2500);
     } else {
       setSaveState("error");
-      setSaveMessage("Reset failed validation — this shouldn't happen; the defaults themselves are invalid.");
+      setSaveMessage(
+        "Reset failed validation — this shouldn't happen; the defaults themselves are invalid.",
+      );
     }
   }
 
@@ -97,81 +120,64 @@ export function SettingsScreen() {
   }
 
   return (
-    <div className="flex h-full flex-col">
-      <header className="flex shrink-0 flex-wrap items-center justify-between gap-x-4 gap-y-2 border-b border-[var(--color-hairline)] px-8 py-5">
-        <div>
-          <h1 className="text-lg font-semibold text-[var(--color-ink)]">Settings</h1>
+    <ScreenShell
+      title="Settings"
+      subtitle="The rules the nightly run follows. Every change here is written to config.yaml."
+      actions={
+        <div className="flex flex-wrap items-center justify-end gap-sp-2">
           {saveMessage && (
-            <div className="mt-1 flex items-center gap-2">
-              <StatusPill tone={saveState === "error" ? "loss" : "gain"}>{saveMessage}</StatusPill>
-            </div>
+            <StatusPill tone={saveState === "error" ? "loss" : "gain"}>{saveMessage}</StatusPill>
           )}
-        </div>
-        <div className="flex shrink-0 items-center gap-2">
-          <button
-            onClick={handleViewCurrent}
-            className="flex items-center gap-1.5 rounded-md border border-[var(--color-hairline-strong)] px-3 py-1.5 text-xs font-medium text-[var(--color-ink-dim)] transition-colors hover:bg-[var(--color-panel-raised)] hover:text-[var(--color-ink)] active:scale-[0.98]"
-          >
-            <Eye size={13} />
+          <Button onClick={handleViewCurrent}>
+            <Eye size={14} />
             {rawOpen ? "Hide raw" : "View current"}
-          </button>
-          <button
-            onClick={handleReset}
-            disabled={saveState === "saving"}
-            className="flex items-center gap-1.5 rounded-md border border-[var(--color-hairline-strong)] px-3 py-1.5 text-xs font-medium text-[var(--color-ink-dim)] transition-colors hover:bg-[var(--color-panel-raised)] hover:text-[var(--color-ink)] active:scale-[0.98] disabled:opacity-50"
-          >
-            <ArrowsCounterClockwise size={13} />
+          </Button>
+          <Button onClick={handleReset} disabled={saveState === "saving"}>
+            <ArrowsCounterClockwise size={14} />
             Reset to defaults
-          </button>
-          <button
-            onClick={handleSave}
-            disabled={saveState === "saving" || !form}
-            className="flex items-center gap-1.5 rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-xs font-semibold text-[#06101f] transition-colors hover:opacity-90 active:scale-[0.98] disabled:opacity-50"
-          >
-            <FloppyDisk size={13} />
+          </Button>
+          <Button variant="primary" onClick={handleSave} disabled={saveState === "saving" || !form}>
+            <FloppyDisk size={14} />
             {saveState === "saving" ? "Saving…" : "Save"}
-          </button>
+          </Button>
         </div>
-      </header>
+      }
+    >
+      {state.kind === "loading" && <LoadingSkeleton />}
+      {state.kind === "error" && <ErrorPanel message={state.message} onRetry={reload} />}
 
-      {loadState.kind === "loading" && <LoadingSkeleton />}
-      {loadState.kind === "error" && <ErrorPanel message={loadState.message} onRetry={load} />}
-      {loadState.kind === "loaded" && form && config && (
-        <div className="flex flex-1 flex-col gap-5 overflow-y-auto px-8 py-6">
+      {state.kind === "loaded" && form && config && (
+        <>
           {rawOpen && (
-            <SectionShell title="Raw config.yaml">
+            <SettingsGroup title="Raw config.yaml">
               {rawLoading ? (
-                <p className="text-sm text-[var(--color-ink-faint)]">Loading…</p>
+                <p className="t-body text-ink-faint">Loading…</p>
               ) : rawText ? (
-                <pre className="num max-h-96 overflow-auto whitespace-pre-wrap text-xs text-[var(--color-ink-dim)]">
+                <pre className="num-table max-h-96 overflow-auto rounded-inner bg-inset p-sp-4 t-meta whitespace-pre-wrap text-ink-dim">
                   {rawText}
                 </pre>
               ) : (
-                <p className="text-sm text-[var(--color-loss)]">Couldn't load the raw file.</p>
+                <p className="t-body text-loss">Couldn't load the raw file.</p>
               )}
-            </SectionShell>
+            </SettingsGroup>
           )}
 
-          <SectionShell title="Portfolio">
-            <div className="grid grid-cols-1 gap-x-6 gap-y-4 sm:grid-cols-2">
-              <NumberField
-                label="Import reminder (days)"
-                value={form.portfolio.import_reminder_days}
-                onChange={(v) => setForm({ ...form, portfolio: { ...form.portfolio, import_reminder_days: v } })}
-                error={fieldErrors["portfolio.import_reminder_days"]}
-              />
-              <div className="flex items-end pb-1.5">
+          <SettingsGroup title="Portfolio">
+            <div className="grid grid-cols-1 gap-x-sp-6 gap-y-sp-5 sm:grid-cols-2">
+              <div className="flex items-end pb-sp-2">
                 <CheckboxField
                   label="Allow fractional shares (manual entry)"
                   checked={form.portfolio.allow_fractional}
-                  onChange={(v) => setForm({ ...form, portfolio: { ...form.portfolio, allow_fractional: v } })}
+                  onChange={(v) =>
+                    setForm({ ...form, portfolio: { ...form.portfolio, allow_fractional: v } })
+                  }
                 />
               </div>
             </div>
-          </SectionShell>
+          </SettingsGroup>
 
-          <SectionShell title="Risk">
-            <div className="grid grid-cols-1 gap-x-6 gap-y-4 sm:grid-cols-2 lg:grid-cols-3">
+          <SettingsGroup title="Risk">
+            <div className="grid grid-cols-1 gap-x-sp-6 gap-y-sp-5 sm:grid-cols-2 lg:grid-cols-3">
               <NumberField label="Max position (% NAV)" value={form.risk.max_position_pct}
                 onChange={(v) => setForm({ ...form, risk: { ...form.risk, max_position_pct: v } })}
                 error={fieldErrors["risk.max_position_pct"]} />
@@ -200,10 +206,10 @@ export function SettingsScreen() {
                 onChange={(v) => setForm({ ...form, risk: { ...form.risk, max_unpriced_held_positions: v } })}
                 error={fieldErrors["risk.max_unpriced_held_positions"]} />
             </div>
-          </SectionShell>
+          </SettingsGroup>
 
-          <SectionShell title="Screener — Stage 1">
-            <div className="grid grid-cols-1 gap-x-6 gap-y-4 sm:grid-cols-2 lg:grid-cols-3">
+          <SettingsGroup title="Screener — Stage 1">
+            <div className="grid grid-cols-1 gap-x-sp-6 gap-y-sp-5 sm:grid-cols-2 lg:grid-cols-3">
               <NumberField label="Min avg daily volume (USD)" value={form.screener.stage1.min_avg_daily_volume_usd}
                 onChange={(v) => setForm({ ...form, screener: { stage1: { ...form.screener.stage1, min_avg_daily_volume_usd: v } } })}
                 error={fieldErrors["screener.stage1.min_avg_daily_volume_usd"]} />
@@ -226,29 +232,29 @@ export function SettingsScreen() {
                 onChange={(v) => setForm({ ...form, screener: { stage1: { ...form.screener.stage1, earnings_proximity_days: v } } })}
                 error={fieldErrors["screener.stage1.earnings_proximity_days"]} />
             </div>
-          </SectionShell>
+          </SettingsGroup>
 
-          <div className="grid grid-cols-1 gap-5 md:grid-cols-2">
-            <SectionShell title="Budget">
+          <div className="grid grid-cols-1 gap-sp-6 md:grid-cols-2">
+            <SettingsGroup title="Budget">
               <NumberField label="Monthly API cap (USD)" value={form.budget.monthly_api_cap_usd}
                 onChange={(v) => setForm({ ...form, budget: { monthly_api_cap_usd: v } })}
                 error={fieldErrors["budget.monthly_api_cap_usd"]} />
-            </SectionShell>
+            </SettingsGroup>
 
-            <SectionShell title="Schedule">
+            <SettingsGroup title="Schedule">
               <TextField label="Nightly run (cron)" value={form.schedule.nightly_run}
                 placeholder="0 22 * * 0-4"
                 onChange={(v) => setForm({ ...form, schedule: { nightly_run: v } })}
                 error={fieldErrors["schedule.nightly_run"]} />
-            </SectionShell>
+            </SettingsGroup>
           </div>
 
-          <p className="pb-2 text-xs text-[var(--color-ink-faint)]">
+          <p className="t-meta text-ink-faint">
             Universe (watchlist, cluster overrides), conviction weights, and a few unmodeled sections
-            (sleeves, sources, options) aren't editable here — see "View current" for the full file.
+            (sleeves, sources, options) aren't editable here — use "View current" for the full file.
           </p>
-        </div>
+        </>
       )}
-    </div>
+    </ScreenShell>
   );
 }

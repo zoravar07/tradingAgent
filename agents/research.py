@@ -54,12 +54,27 @@ ticker, any time the evidence just isn't there.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from pydantic import BaseModel, Field, model_validator
 
+from core.cache import FileCache
 from core.config import ResearchConfig
-from core.llm import LLMClient, UsageRecord
+from core.llm import LLMClient, UsageRecord, web_search_tool
+
+# The digest call is told to emit exactly this when its searches turn up
+# nothing dated and sourced — a machine-checkable "no news" rather than
+# prose that could be mistaken for a finding.
+NO_MATERIAL_NEWS_MARKER = "NO_MATERIAL_NEWS"
+
+NEWS_DIGEST_SYSTEM_PROMPT = f"""You are a news researcher for an equity analyst. Use the web_search tool to find what has actually been reported about one company in the last N days: earnings and guidance, filings (8-K, 10-Q, 10-K, 13D), contracts, management changes, regulatory actions, product events, and sector news that hits the name directly.
+
+Hard rules:
+- Report only what you found via search in this session. Do not use prior knowledge for events, dates, or figures — your training data is stale and unsourced facts are worse than none.
+- Every item must be dated (YYYY-MM-DD) and drawn from a cited source. One line per item: date, what happened, why it matters to the investment case.
+- If your searches return nothing dated within the window that could matter to the investment case, respond with exactly {NO_MATERIAL_NEWS_MARKER} and nothing else.
+- No preamble, no narration of your searching, no summary of the company, no opinions about the stock. Facts with dates and sources only.
+- Write each item so a smart beginner can follow it: plain words, and explain any technical term or abbreviation in brackets the first time it appears (e.g. "guidance (the company's own forecast)", "8-K (a filing companies must make when something important happens)")."""
 
 # Matches §5.2's table order, minus portfolio_fit and discord_signal (see
 # module docstring). scoring.py's compute_conviction only uses whatever
@@ -104,7 +119,14 @@ Also produce:
 - key_risks: concrete, specific risks — not generic boilerplate ("market risk", "execution risk" alone are not acceptable).
 - thesis_summary: 2-3 sentences a reader acts on.
 
-You do not decide whether to buy or sell, how large a position should be, where a stop should sit, or what the final conviction score is. You analyze the evidence; something else decides."""
+You do not decide whether to buy or sell, how large a position should be, where a stop should sit, or what the final conviction score is. You analyze the evidence; something else decides.
+
+Writing style — this is read by a smart beginner, not an analyst:
+- Plain English, short sentences. Say what a number means for the investment, not just the number.
+- The first time you use a technical term or abbreviation, explain it in a few words in brackets right there, e.g. "free cash flow (the cash left over after running the business)", "P/E of 40 (the share price is 40 times last year's profit per share)". After that, use the term freely.
+- No unexplained abbreviations: no FCF, TAM, SBC, ROIC, DMA, RS, YoY, capex without the bracketed meaning on first use.
+- Prefer "the company", "its customers", "its profit" over sector shorthand. Say "compared with the S&P 500" rather than "vs SPY".
+- Keep the analysis as rigorous as before; only the words get simpler."""
 
 
 class Catalyst(BaseModel):
@@ -176,9 +198,69 @@ class ResearchMemo(BaseModel):
 
 
 @dataclass
+class NewsDigest:
+    """The grounded-news result for one ticker. `found_news` is the only
+    thing the briefing may show: it requires at least one citation URL, so
+    an unsourced claim — however plausible — is never surfaced as news."""
+
+    ticker: str
+    text: str = ""
+    source_urls: list[str] = field(default_factory=list)
+    usage: UsageRecord | None = None
+    error: str | None = None
+    cached: bool = False  # served from the news cache, no call made
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
+
+    @property
+    def found_news(self) -> bool:
+        if not self.ok or not self.source_urls:
+            return False
+        return NO_MATERIAL_NEWS_MARKER not in self.text
+
+
+def _digest_cache_key(ticker: str, config: ResearchConfig) -> str:
+    return f"news:{ticker.upper()}:{config.news_lookback_days}d"
+
+
+def run_news_digest(
+    llm: LLMClient, ticker: str, config: ResearchConfig, cache: FileCache | None = None
+) -> NewsDigest:
+    """One web-search-grounded text call per researched name, reused from
+    `cache` for `config.news_cache_hours` so the same name isn't searched
+    again the next night. A failure surfaces as `error`, never raises — a
+    missing digest degrades the memo to "no recent news retrieved", it
+    doesn't kill the run. Only successful digests are cached."""
+    key = _digest_cache_key(ticker, config)
+    if cache is not None:
+        hit = cache.get(key)
+        if hit is not None:
+            return NewsDigest(ticker=ticker, text=hit["text"], source_urls=list(hit["source_urls"]), cached=True)
+    user_message = (
+        f"Company ticker: {ticker}\nWindow: the last {config.news_lookback_days} days, ending today.\n"
+        f"Search for material developments in that window and list them as instructed. "
+        f"If there are none, reply {NO_MATERIAL_NEWS_MARKER}."
+    )
+    tools = [web_search_tool(config.digest_model, config.web_search_max_uses)]
+    try:
+        result = llm.call_text(
+            model=config.digest_model, system=NEWS_DIGEST_SYSTEM_PROMPT, user_message=user_message, tools=tools, max_tokens=1200
+        )
+    except Exception as exc:  # noqa: BLE001 — one bad digest must not kill the run
+        return NewsDigest(ticker=ticker, error=str(exc))
+    digest = NewsDigest(ticker=ticker, text=result.text.strip(), source_urls=result.source_urls, usage=result.usage)
+    if cache is not None:
+        cache.set(key, {"text": digest.text, "source_urls": digest.source_urls}, config.news_cache_hours * 3600)
+    return digest
+
+
+@dataclass
 class ResearchContext:
     ticker: str
-    context_text: str  # pre-assembled by the caller: fundamentals, technicals, earnings, ownership, news
+    context_text: str  # pre-assembled by the caller: fundamentals, technicals, earnings, ownership
+    news_digest: NewsDigest | None = None  # grounded via web search (run_news_digest); None = not retrieved
 
 
 @dataclass
@@ -193,11 +275,33 @@ class ResearchResult:
         return self.error is None and self.memo is not None
 
 
+def _news_section(context: ResearchContext) -> str:
+    """The only recent-events evidence the memo is allowed to use. The system
+    prompt already forbids inventing data; this makes the absence of news an
+    explicit input rather than a gap the model might fill from memory."""
+    digest = context.news_digest
+    if digest is not None and digest.found_news:
+        sources = "\n".join(f"- {url}" for url in digest.source_urls)
+        return (
+            "Recent news (retrieved by web search, dated, sourced — the ONLY evidence to use for recent events; "
+            "do not add events from memory):\n"
+            f"{digest.text}\nSources:\n{sources}"
+        )
+    return (
+        "Recent news: no recent news was retrieved for this name (either none was found in the lookback "
+        "window or retrieval failed). Do not supply recent events from memory; if you have no other "
+        "evidence for news_sentiment, mark it data_available=false."
+    )
+
+
 def run_research(llm: LLMClient, context: ResearchContext, config: ResearchConfig, max_tokens: int = 4096) -> ResearchResult:
     """One memo call. A failure (budget exhausted, malformed output after
     retries, API error) doesn't raise — it surfaces as `error` so a batch run
     can skip one bad ticker without losing the rest of the briefing."""
-    user_message = f"Ticker: {context.ticker}\n\n{context.context_text}\n\nProduce the investment memo now."
+    user_message = (
+        f"Ticker: {context.ticker}\n\n{context.context_text}\n\n{_news_section(context)}\n\n"
+        "Produce the investment memo now."
+    )
     try:
         result = llm.call_structured(
             model=config.model,

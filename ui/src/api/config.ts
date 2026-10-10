@@ -1,7 +1,7 @@
 import type { ConfigResponse, EditableConfig, ValidationErrorItem } from "../types/settings";
 import { ApiError } from "./client";
 
-const API_BASE = "http://localhost:8000/api";
+import { apiBase } from "./base";
 
 export type ConfigSubmitResult =
   | { ok: true; data: ConfigResponse }
@@ -10,7 +10,7 @@ export type ConfigSubmitResult =
 export async function fetchConfig(): Promise<ConfigResponse> {
   let res: Response;
   try {
-    res = await fetch(`${API_BASE}/config`);
+    res = await fetch(`${await apiBase()}/config`);
   } catch {
     throw new ApiError("Can't reach the Z Money API. Is it running?");
   }
@@ -21,7 +21,7 @@ export async function fetchConfig(): Promise<ConfigResponse> {
 async function submit(path: string, body?: EditableConfig): Promise<ConfigSubmitResult> {
   let res: Response;
   try {
-    res = await fetch(`${API_BASE}${path}`, {
+    res = await fetch(`${await apiBase()}${path}`, {
       method: "POST",
       headers: body ? { "Content-Type": "application/json" } : undefined,
       body: body ? JSON.stringify(body) : undefined,
